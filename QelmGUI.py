@@ -3,7 +3,7 @@
 
 """
 ====================================================================================================
-Quantum-Enhanced Language Model (QELM) - Trainer with multi thread support. *CPU/GPU*
+Quantum-Enhanced Language Model (QELM) - Trainer with multi thread support. *CPU/GPU* -
 ====================================================================================================
 
 This script defines a Quantum-Enhanced Language Model (QELM) with the following features:
