@@ -13,10 +13,10 @@ This script defines a Quantum-Enhanced Language Model (QELM) with the following 
 4. Enhanced Model Architecture with residual connections and layer normalization.
 5. Robust Parameter Persistence with versioning and validation using a custom .qelm file extension.
 6. User-Friendly Graphical User Interface (GUI) using Tkinter for training, inference, saving, loading, and exploring token mappings.
-7. **Fixed Issues:**
-   - Resolved shape mismatch error during residual connections by ensuring consistent tensor shapes across model components.
-   - Added global exception handling to prevent the script from closing unexpectedly and to display error messages to the user.
-   - Suppressed excessive logging from worker processes to prevent resource exhaustion.
+7. **Enhanced Logging:**
+   - Block-wise logging to monitor training progress.
+   - Thread-safe logging to prevent GUI freezing.
+   - Immediate feedback in the GUI to confirm active training.
 
 Dependencies:
 - qiskit
@@ -25,6 +25,8 @@ Dependencies:
 - scipy
 - nltk
 - tkinter
+- tensorflow
+- psutil (optional for resource monitoring)
 
 Ensure all dependencies are installed before running the script.
 
@@ -34,6 +36,13 @@ Check with Qiskit to ensure calls are correct. They have a tendency to change th
 
 import sys
 import os
+
+# =====================
+# Set Environment Variables
+# =====================
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'  # Disable oneDNN custom operations
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'   # Suppress TensorFlow INFO and WARNING messages
+
 import json
 import time
 import logging
@@ -43,6 +52,7 @@ import multiprocessing
 import concurrent.futures
 from collections import defaultdict
 from typing import List, Dict, Tuple
+import queue
 
 import numpy as np
 import nltk
@@ -50,6 +60,10 @@ from nltk.tokenize import word_tokenize
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 from qiskit.circuit import Parameter
+
+import tensorflow as tf  # TensorFlow import after setting environment variables
+from tensorflow import keras
+from tensorflow.keras.utils import plot_model
 
 try:
     import psutil
@@ -62,13 +76,25 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 # Initialize NLTK quietly
 nltk.download('punkt', quiet=True)
 
+# =====================
 # Logging Configuration
+# =====================
+
+# Desired log directory
+log_dir = r'C:\Directory\'  # Replace 'Directory' with the directory you want to save logs to.
+
+# Create log directory if it doesn't exist
+os.makedirs(log_dir, exist_ok=True)
+
+# Configure logging to write to the specified log file
 logging.basicConfig(
-    filename='qelm_enhanced.log',
+    filename=os.path.join(log_dir, 'qelm_enhanced.log'),
     filemode='a',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+# Also log to console
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -410,13 +436,13 @@ class QuantumLanguageModel:
         x = self.embeddings[input_ids[-1]]
 
         # Attention
-        attn_output_query = self.attn.forward(x, mode='query')  # (256,)
-        attn_output_key = self.attn.forward(x, mode='key')      # (256,)
-        attn_output_value = self.attn.forward(x, mode='value')  # (256,)
-        attn_output_out = self.attn.forward(x, mode='out')      # (256,)
+        attn_output_query = self.attn.forward(x, mode='query')  # (embed_dim,)
+        attn_output_key = self.attn.forward(x, mode='key')      # (embed_dim,)
+        attn_output_value = self.attn.forward(x, mode='value')  # (embed_dim,)
+        attn_output_out = self.attn.forward(x, mode='out')      # (embed_dim,)
 
         # Combine attention outputs
-        attn_output = attn_output_query + attn_output_key + attn_output_value + attn_output_out  # (256,)
+        attn_output = attn_output_query + attn_output_key + attn_output_value + attn_output_out  # (embed_dim,)
 
         if use_residual:
             x = normalize_vector(x + attn_output)
@@ -424,15 +450,15 @@ class QuantumLanguageModel:
             x = attn_output
 
         # Feed Forward
-        ffn_output_w1 = self.ffn.forward(x, layer='w1')  # (512,)
-        ffn_output_w2 = self.ffn.forward(ffn_output_w1, layer='w2')  # (256,)
+        ffn_output_w1 = self.ffn.forward(x, layer='w1')  # (hidden_dim,)
+        ffn_output_w2 = self.ffn.forward(ffn_output_w1, layer='w2')  # (embed_dim,)
 
         if use_residual:
-            x = normalize_vector(x + ffn_output_w2)  # (256,) + (256,) = (256,)
+            x = normalize_vector(x + ffn_output_w2)  # (embed_dim,) + (embed_dim,) = (embed_dim,)
         else:
-            x = ffn_output_w2  # (256,)
+            x = ffn_output_w2  # (embed_dim,)
 
-        logits = self.W_out @ x  # (10000,256) @ (256,) = (10000,)
+        logits = self.W_out @ x  # (vocab_size, embed_dim) @ (embed_dim,) = (vocab_size,)
 
         return logits
 
@@ -454,8 +480,8 @@ class QuantumLanguageModel:
         attn_size = (self.attn.query_params.size + self.attn.key_params.size +
                      self.attn.value_params.size + self.attn.out_params.size)
         ffn_size = self.ffn.w1_params.size + self.ffn.w2_params.size
-        proj_size = self.embed_dim * self.hidden_dim  # (256 * 512) = 131072
-        out_size = self.vocab_size * self.embed_dim  # (10000 * 256) = 2560000
+        proj_size = self.embed_dim * self.hidden_dim  # e.g., (256 * 512) = 131072
+        out_size = self.vocab_size * self.embed_dim  # e.g., (10000 * 256) = 2560000
         expected = attn_size + ffn_size + proj_size + out_size
 
         if params.shape[0] != expected:
@@ -564,7 +590,9 @@ def load_real_dataset(file_path: str, vocab_size: int) -> Tuple[np.ndarray, np.n
     sorted_tokens = sorted(freq.items(), key=lambda x: x[1], reverse=True)
     # Reserve indices for special tokens
     token_to_id = {token: idx for idx, token in enumerate(special_tokens)}
-    for token, _ in sorted_tokens[:vocab_size - len(special_tokens)]:
+    for token, _ in sorted_tokens:
+        if len(token_to_id) >= vocab_size:
+            break
         if token not in token_to_id:
             token_to_id[token] = len(token_to_id)
     id_to_token = {idx: token for token, idx in token_to_id.items()}
@@ -573,12 +601,8 @@ def load_real_dataset(file_path: str, vocab_size: int) -> Tuple[np.ndarray, np.n
     for i in range(len(tokens)-1):
         current_token = tokens[i]
         next_token = tokens[i+1]
-        if current_token in token_to_id and next_token in token_to_id:
-            X.append(token_to_id[current_token])
-            Y_ids.append(token_to_id[next_token])
-        else:
-            X.append(token_to_id.get(current_token, token_to_id["<UNK>"]))
-            Y_ids.append(token_to_id.get(next_token, token_to_id["<UNK>"]))
+        X.append(token_to_id.get(current_token, token_to_id["<UNK>"]))
+        Y_ids.append(token_to_id.get(next_token, token_to_id["<UNK>"]))
 
     Y = np.array(Y_ids, dtype=np.int32)
 
@@ -666,14 +690,14 @@ def compute_gradient_for_parameter(args):
         shift = np.pi / 2
         model.shift_parameter(i, shift)
         loss_plus = np.mean([
-            cross_entropy_loss(model.forward([x]), y)
+            cross_entropy_loss(model.forward([x], use_residual=True), y)
             for x, y in zip(X, Y)
         ])
 
         model.unshift_parameter(i, shift)
         model.shift_parameter(i, -shift)
         loss_minus = np.mean([
-            cross_entropy_loss(model.forward([x]), y)
+            cross_entropy_loss(model.forward([x], use_residual=True), y)
             for x, y in zip(X, Y)
         ])
 
@@ -686,13 +710,18 @@ def compute_gradient_for_parameter(args):
         return i, 0.0
 
 
-def compute_gradients_parallel(model: QuantumLanguageModel, X: np.ndarray, Y: np.ndarray, num_processes: int = 1) -> np.ndarray:
+def compute_gradients_parallel(model: QuantumLanguageModel, X: np.ndarray, Y: np.ndarray, num_processes: int = 1, progress_callback=None) -> np.ndarray:
     """
     Compute gradients for all parameters in parallel.
+    Calls progress_callback(completed, total, param_index, gradient) for each computed gradient.
     """
     gradients = np.zeros_like(model.get_all_parameters())
     original_params = model.get_all_parameters().copy()
     total_params = len(original_params)
+
+    # Define block size for logging
+    block_size = 10000  # Adjust as needed
+    blocks = (total_params + block_size - 1) // block_size
 
     args_list = [
         (
@@ -710,19 +739,25 @@ def compute_gradients_parallel(model: QuantumLanguageModel, X: np.ndarray, Y: np
         for i in range(total_params)
     ]
 
-    # Parallel execution
+    # Parallel execution with progress callback
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_processes) as executor:
-        futures = [executor.submit(compute_gradient_for_parameter, args) for args in args_list]
+        futures = {executor.submit(compute_gradient_for_parameter, args): args[-1] for args in args_list}
+        completed = 0
         for future in concurrent.futures.as_completed(futures):
             i, gradient = future.result()
             gradients[i] = gradient
+            completed += 1
+            # Log progress every block_size parameters
+            if completed % block_size == 0 or completed == total_params:
+                if progress_callback:
+                    progress_callback(completed, total_params, i, gradient)
 
     return gradients
 
 
 def train_model(model: QuantumLanguageModel, X: np.ndarray, Y: np.ndarray,
                 epochs: int = 10, lr: float = 0.001, num_threads: int = 1,
-                log_callback=None, stop_flag=None, time_lock: threading.Lock = None, time_data=None,
+                log_queue: queue.Queue = None, stop_flag=None, time_lock: threading.Lock = None, time_data=None,
                 optimizer=None):
     """
     Train the Quantum Language Model using the provided optimizer.
@@ -735,14 +770,29 @@ def train_model(model: QuantumLanguageModel, X: np.ndarray, Y: np.ndarray,
 
     for epoch in range(epochs):
         if stop_flag and stop_flag.is_set():
-            if log_callback:
-                log_callback("Training stopped by user.\n")
+            if log_queue:
+                log_queue.put("Training stopped by user.\n")
             break
 
-        if log_callback:
-            log_callback(f"Starting Epoch {epoch+1}/{epochs}\n")
+        if log_queue:
+            log_queue.put(f"Starting Epoch {epoch+1}/{epochs}\n")
 
-        gradients = compute_gradients_parallel(model, X, Y, num_processes=num_threads)
+        epoch_start_time = time.time()
+
+        def progress_callback(completed, total, param_index, gradient):
+            """
+            Callback function to update progress.
+            """
+            progress = (completed / total) * 100
+            if log_queue:
+                log_queue.put(f"Gradient Computation Progress: {completed}/{total} parameters ({progress:.2f}%) completed.\n")
+            # Since we are in a separate thread, use thread-safe method to update GUI
+            # This requires passing a reference or using thread-safe queues
+            # For simplicity, we can send the progress value through the log_queue and parse it in the GUI
+            # Alternatively, use another queue or shared variable
+            # Here, we'll skip updating the progress bar via this callback
+
+        gradients = compute_gradients_parallel(model, X, Y, num_processes=num_threads, progress_callback=progress_callback)
 
         # Update parameters using optimizer
         if optimizer:
@@ -756,23 +806,27 @@ def train_model(model: QuantumLanguageModel, X: np.ndarray, Y: np.ndarray,
 
         # Compute average loss and perplexity
         total_loss = np.mean([
-            cross_entropy_loss(model.forward([x]), y)
+            cross_entropy_loss(model.forward([x], use_residual=True), y)
             for x, y in zip(X, Y)
         ])
         total_perplexity = np.mean([
-            perplexity(model.forward([x]), y)
+            perplexity(model.forward([x], use_residual=True), y)
             for x, y in zip(X, Y)
         ])
 
-        if log_callback:
-            log_callback(f"Epoch {epoch+1}/{epochs}, Average Loss: {total_loss:.6f}, Perplexity: {total_perplexity:.6f}\n")
+        epoch_end_time = time.time()
+        epoch_duration = epoch_end_time - epoch_start_time
+
+        # Update GUI log
+        if log_queue:
+            log_queue.put(f"Epoch {epoch+1}/{epochs} completed in {epoch_duration:.2f}s, Average Loss: {total_loss:.6f}, Perplexity: {total_perplexity:.6f}\n")
 
         # Update evaluation metrics (BLEU score can be computed on a validation set if available)
 
         if time_lock:
             with time_lock:
                 time_data['epochs_done'] = epoch + 1
-                elapsed = time.time() - start_time
+                elapsed = epoch_end_time - start_time
                 if time_data['epochs_done'] > 0 and time_data['epochs_done'] < epochs:
                     per_epoch = elapsed / time_data['epochs_done']
                     remaining = (epochs - time_data['epochs_done']) * per_epoch
@@ -780,8 +834,15 @@ def train_model(model: QuantumLanguageModel, X: np.ndarray, Y: np.ndarray,
                 else:
                     time_data['remaining'] = 0
 
-    if log_callback and (not stop_flag or not stop_flag.is_set()):
-        log_callback("Training completed.\n")
+        # Update the epoch_progress bar
+        epoch_progress = ((epoch + 1) / epochs) * 100
+        if epoch_progress > 100:
+            epoch_progress = 100
+        if log_queue:
+            log_queue.put(f"Epoch Progress: {epoch_progress:.2f}%\n")
+
+    if log_queue and (not stop_flag or not stop_flag.is_set()):
+        log_queue.put("Training completed.\n")
 
 
 def softmax(x: np.ndarray) -> np.ndarray:
@@ -798,7 +859,7 @@ def run_inference(model: QuantumLanguageModel, input_sequence: List[int], token_
     """
     generated = input_sequence.copy()
     for _ in range(max_length):
-        logits = model.forward([generated[-1]])
+        logits = model.forward([generated[-1]], use_residual=True)
         probabilities = softmax(logits / temperature)
 
         # Sample from the probability distribution
@@ -824,59 +885,70 @@ class QELM_GUI:
     Graphical User Interface for the Quantum-Enhanced Language Model.
     """
     def __init__(self, master):
-        self.master = master
-        master.title("QELM Trainer - Enhanced")
-        master.geometry("1400x900")  # Adjusted window size for better layout
-        master.resizable(False, False)
+        try:
+            self.master = master
+            master.title("QELM Trainer - Enhanced")
+            master.geometry("1600x1000")  # Increased window size for better layout
+            master.resizable(False, False)
 
-        # Model parameters
-        self.vocab_size = 10000  # Increased vocab size
-        self.embed_dim = 256      # Increased embedding dimension
-        self.num_heads = 8        # Increased number of attention heads
-        self.hidden_dim = 512     # Increased hidden dimension
-        self.sim_method = 'cpu'
-        self.num_threads = min(8, multiprocessing.cpu_count())  # Adjusted for higher model complexity
-        self.model = QuantumLanguageModel(self.vocab_size, self.embed_dim, self.num_heads, self.hidden_dim,
-                                          sim_method=self.sim_method, num_threads=self.num_threads, enable_logging=True)
+            # Default Model parameters
+            self.vocab_size = 10000  # Default vocabulary size
+            self.embed_dim = 256      # Default embedding dimension
+            self.num_heads = 8        # Default number of attention heads
+            self.hidden_dim = 512     # Default hidden dimension
+            self.sim_method = 'cpu'
+            self.num_threads = min(8, multiprocessing.cpu_count())  # Adjusted for higher model complexity
+            self.model = QuantumLanguageModel(self.vocab_size, self.embed_dim, self.num_heads, self.hidden_dim,
+                                              sim_method=self.sim_method, num_threads=self.num_threads, enable_logging=True)
 
-        self.token_to_id = {}
-        self.id_to_token = {}
+            self.token_to_id = {}
+            self.id_to_token = {}
 
-        # Initialize optimizer
-        self.optimizer = AdamOptimizer(self.model.get_all_parameters(), lr=0.001)
+            # Initialize optimizer
+            self.optimizer = AdamOptimizer(self.model.get_all_parameters(), lr=0.001)
 
-        # Training controls
-        self.stop_flag = threading.Event()
-        self.time_data = {'start_time': 0, 'epochs_done': 0, 'remaining': 0, 'epochs': 0}
-        self.time_lock = threading.Lock()
+            # Training controls
+            self.stop_flag = threading.Event()
+            self.time_data = {'start_time': 0, 'epochs_done': 0, 'remaining': 0, 'epochs': 0}
+            self.time_lock = threading.Lock()
 
-        # Initialize per-process CPU usage monitoring
-        if psutil:
-            self.process = psutil.Process(os.getpid())
-            self.process.cpu_percent(interval=None)  # Initialize
-        else:
-            self.process = None
+            # Initialize per-process CPU usage monitoring
+            if psutil:
+                self.process = psutil.Process(os.getpid())
+                self.process.cpu_percent(interval=None)  # Initialize
+            else:
+                self.process = None
 
-        # Configure GUI appearance
-        self.master.configure(bg="#2C3E50")
-        style = ttk.Style(self.master)
-        style.theme_use('clam')
-        style.configure(".", background="#2C3E50", foreground="white")
-        style.configure("TFrame", background="#2C3E50")
-        style.configure("TLabelFrame", background="#34495E", foreground="white")
-        style.configure("TLabel", background="#2C3E50", foreground="white")
-        style.configure("TButton", background="#34495E", foreground="white", padding=6, relief="flat")
-        style.configure("TNotebook", background="#2C3E50")
-        style.configure("TNotebook.Tab", background="#34495E", foreground="white")
-        style.configure("Horizontal.TProgressbar", background="#1ABC9C", troughcolor="#34495E")
-        # Lighter background for Entry/Spinbox
-        style.configure("Custom.TEntry", fieldbackground="#455A64", foreground="white", insertcolor="white")
-        style.configure("TSpinbox", fieldbackground="#455A64", foreground="white")
-        style.map("TButton", foreground=[('active', 'white')], background=[('active', '#1F2A36')])
+            # Configure GUI appearance
+            self.master.configure(bg="#2C3E50")
+            style = ttk.Style(self.master)
+            style.theme_use('clam')
+            style.configure(".", background="#2C3E50", foreground="white")
+            style.configure("TFrame", background="#2C3E50")
+            style.configure("TLabelFrame", background="#34495E", foreground="white")
+            style.configure("TLabel", background="#2C3E50", foreground="white")
+            style.configure("TButton", background="#34495E", foreground="white", padding=6, relief="flat")
+            style.configure("TNotebook", background="#2C3E50")
+            style.configure("TNotebook.Tab", background="#34495E", foreground="white")
+            style.configure("Horizontal.TProgressbar", background="#1ABC9C", troughcolor="#34495E")
+            # Lighter background for Entry/Spinbox
+            style.configure("Custom.TEntry", fieldbackground="#455A64", foreground="white", insertcolor="white")
+            style.configure("TSpinbox", fieldbackground="#455A64", foreground="white")
+            style.map("TButton", foreground=[('active', 'white')], background=[('active', '#1F2A36')])
 
-        self.create_widgets()
-        self.update_resource_usage()
-        self.update_time_label()
+            self.create_widgets()
+            self.update_resource_usage()
+            self.update_time_label()
+
+            # Initialize log queue and start log handler
+            self.log_queue = queue.Queue()
+            self.master.after(100, self.process_log_queue)
+
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            logging.critical(f"GUI Initialization error:\n{error_trace}")
+            messagebox.showerror("Initialization Error", f"An error occurred during GUI initialization:\n{e}\n\nCheck the log file for more details.")
+            sys.exit(1)
 
     def create_widgets(self):
         """
@@ -911,18 +983,43 @@ class QELM_GUI:
         select_dataset_btn = ttk.Button(dataset_frame, text="Select Dataset", command=self.select_dataset)
         select_dataset_btn.pack(side='right', padx=10, pady=10)
 
-        hyperparams_frame = ttk.LabelFrame(self.tab_train, text="Hyperparameters")
+        hyperparams_frame = ttk.LabelFrame(self.tab_train, text="Model Parameters")
         hyperparams_frame.pack(fill='x', padx=10, pady=10)
 
-        ttk.Label(hyperparams_frame, text="Epochs:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
-        self.epochs_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
-        self.epochs_entry.insert(0, "10")
-        self.epochs_entry.grid(row=0, column=1, padx=10, pady=10, sticky='w')
+        # Vocabulary Size
+        ttk.Label(hyperparams_frame, text="Vocabulary Size:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
+        self.vocab_size_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
+        self.vocab_size_entry.insert(0, str(self.vocab_size))
+        self.vocab_size_entry.grid(row=0, column=1, padx=10, pady=10, sticky='w')
 
-        ttk.Label(hyperparams_frame, text="Learning Rate:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
+        # Embedding Dimension
+        ttk.Label(hyperparams_frame, text="Embedding Dimension:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
+        self.embed_dim_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
+        self.embed_dim_entry.insert(0, str(self.embed_dim))
+        self.embed_dim_entry.grid(row=1, column=1, padx=10, pady=10, sticky='w')
+
+        # Number of Attention Heads
+        ttk.Label(hyperparams_frame, text="Number of Attention Heads:").grid(row=2, column=0, padx=10, pady=10, sticky='e')
+        self.num_heads_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
+        self.num_heads_entry.insert(0, str(self.num_heads))
+        self.num_heads_entry.grid(row=2, column=1, padx=10, pady=10, sticky='w')
+
+        # Hidden Dimension
+        ttk.Label(hyperparams_frame, text="Hidden Dimension:").grid(row=3, column=0, padx=10, pady=10, sticky='e')
+        self.hidden_dim_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
+        self.hidden_dim_entry.insert(0, str(self.hidden_dim))
+        self.hidden_dim_entry.grid(row=3, column=1, padx=10, pady=10, sticky='w')
+
+        # Learning Rate and Epochs
+        ttk.Label(hyperparams_frame, text="Learning Rate:").grid(row=4, column=0, padx=10, pady=10, sticky='e')
         self.lr_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
         self.lr_entry.insert(0, "0.001")
-        self.lr_entry.grid(row=1, column=1, padx=10, pady=10, sticky='w')
+        self.lr_entry.grid(row=4, column=1, padx=10, pady=10, sticky='w')
+
+        ttk.Label(hyperparams_frame, text="Epochs:").grid(row=5, column=0, padx=10, pady=10, sticky='e')
+        self.epochs_entry = ttk.Entry(hyperparams_frame, width=15, style="Custom.TEntry")
+        self.epochs_entry.insert(0, "2")  # Reduced epochs for testing
+        self.epochs_entry.grid(row=5, column=1, padx=10, pady=10, sticky='w')
 
         sim_settings_frame = ttk.LabelFrame(self.tab_train, text="Simulation Settings")
         sim_settings_frame.pack(fill='x', padx=10, pady=10)
@@ -964,8 +1061,17 @@ class QELM_GUI:
         self.load_button = ttk.Button(train_controls_frame, text="Load Model", command=self.load_model)
         self.load_button.pack(side='left', padx=10, pady=10)
 
-        self.progress = ttk.Progressbar(self.tab_train, orient='horizontal', length=600, mode='determinate')
-        self.progress.pack(pady=10)
+        # Progress Bars
+        progress_bars_frame = ttk.Frame(self.tab_train)
+        progress_bars_frame.pack(fill='x', padx=10, pady=10)
+
+        ttk.Label(progress_bars_frame, text="Training Progress:").pack(anchor='w', padx=10, pady=5)
+        self.epoch_progress = ttk.Progressbar(progress_bars_frame, orient='horizontal', length=600, mode='determinate')
+        self.epoch_progress.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(progress_bars_frame, text="Gradient Computation Progress:").pack(anchor='w', padx=10, pady=5)
+        self.gradient_progress = ttk.Progressbar(progress_bars_frame, orient='horizontal', length=600, mode='determinate')
+        self.gradient_progress.pack(fill='x', padx=10, pady=5)
 
         log_frame = ttk.LabelFrame(self.tab_train, text="Training Log")
         log_frame.pack(fill='both', expand=True, padx=10, pady=10)
@@ -1045,6 +1151,23 @@ class QELM_GUI:
         self.time_label = ttk.Label(usage_frame, text="Elapsed: 0s | Remaining: Estimating...")
         self.time_label.pack(anchor='w', padx=10, pady=5)
 
+    def process_log_queue(self):
+        """
+        Process messages from the log queue and update the GUI accordingly.
+        """
+        try:
+            while not self.log_queue.empty():
+                message = self.log_queue.get_nowait()
+                # Append all messages to the training log
+                self.train_log.config(state='normal')
+                self.train_log.insert(tk.END, message)
+                self.train_log.see(tk.END)
+                self.train_log.config(state='disabled')
+        except Exception as e:
+            logging.error(f"Error processing log queue: {e}")
+        finally:
+            self.master.after(100, self.process_log_queue)  # Continue polling
+
     def update_threads_based_on_method(self):
         """
         Update the maximum number of threads based on the simulation method.
@@ -1057,12 +1180,10 @@ class QELM_GUI:
 
     def log_train(self, message: str):
         """
-        Log messages to the training log.
+        Log messages to the training log via the queue.
         """
-        self.train_log.config(state='normal')
-        self.train_log.insert(tk.END, message)
-        self.train_log.see(tk.END)
-        self.train_log.config(state='disabled')
+        if hasattr(self, 'log_queue'):
+            self.log_queue.put(message)
 
     def log_infer(self, message: str):
         """
@@ -1105,12 +1226,23 @@ class QELM_GUI:
         Start the training process in a separate thread.
         """
         try:
-            epochs = int(self.epochs_entry.get())
+            # Retrieve and validate model parameters from GUI
+            vocab_size = int(self.vocab_size_entry.get())
+            embed_dim = int(self.embed_dim_entry.get())
+            num_heads = int(self.num_heads_entry.get())
+            hidden_dim = int(self.hidden_dim_entry.get())
             lr = float(self.lr_entry.get())
-            if epochs <= 0 or lr <= 0:
+            epochs = int(self.epochs_entry.get())
+
+            if vocab_size <= 0 or embed_dim <= 0 or num_heads <= 0 or hidden_dim <= 0 or lr <= 0 or epochs <= 0:
                 raise ValueError
+
+            if embed_dim % num_heads != 0:
+                messagebox.showerror("Invalid Input", "Embedding Dimension must be divisible by Number of Attention Heads.")
+                return
+
         except ValueError:
-            messagebox.showerror("Invalid Input", "Please enter positive values for epochs and learning rate.")
+            messagebox.showerror("Invalid Input", "Please enter valid positive integers for model parameters and epochs, and a positive float for learning rate.")
             return
 
         sim_method = self.sim_method_var.get()
@@ -1122,10 +1254,10 @@ class QELM_GUI:
             self.num_threads_var.set(num_threads)
 
         # Load dataset
-        if hasattr(self, 'dataset_path') and hasattr(self, 'dataset_path') and self.dataset_path:
+        if hasattr(self, 'dataset_path') and self.dataset_path:
             dataset_path = self.dataset_path
             try:
-                X, Y, token_to_id = load_real_dataset(dataset_path, self.vocab_size)
+                X, Y, token_to_id = load_real_dataset(dataset_path, vocab_size)
                 self.X = X
                 self.Y = Y
                 self.token_to_id = token_to_id
@@ -1137,10 +1269,22 @@ class QELM_GUI:
                 messagebox.showerror("Dataset Load Error", err_msg)
                 return
         else:
-            X, Y = create_synthetic_dataset(self.vocab_size, num_samples=500)  # Increased samples for better training
+            X, Y = create_synthetic_dataset(vocab_size, num_samples=500)  # Increased samples for better training
             self.X = X
             self.Y = Y
             self.log_train("Using synthetic dataset for training.\n")
+
+        # Reinitialize the model with new parameters
+        try:
+            self.model = QuantumLanguageModel(vocab_size, embed_dim, num_heads, hidden_dim,
+                                             sim_method=sim_method, num_threads=num_threads, enable_logging=True)
+            self.optimizer = AdamOptimizer(self.model.get_all_parameters(), lr=lr)
+            self.log_train("Model re-initialized with new parameters.\n")
+        except Exception as e:
+            err_msg = f"Failed to initialize model with new parameters:\n{traceback.format_exc()}"
+            self.log_train(err_msg + "\n")
+            messagebox.showerror("Model Initialization Error", err_msg)
+            return
 
         # Update model simulation settings
         self.model.sim_method = sim_method
@@ -1153,9 +1297,6 @@ class QELM_GUI:
         self.model.ffn.num_threads = num_threads
         self.model.ffn.backend = self.model.ffn.initialize_simulator()
 
-        # Initialize optimizer with current parameters
-        self.optimizer = AdamOptimizer(self.model.get_all_parameters(), lr=lr)
-
         # Disable buttons during training
         self.train_button.config(state='disabled')
         self.save_button.config(state='disabled')
@@ -1163,7 +1304,12 @@ class QELM_GUI:
         self.infer_button.config(state='disabled')
         self.stop_flag.clear()
 
-        self.progress['value'] = 0
+        # Reset progress bars and logs
+        self.epoch_progress['value'] = 0
+        self.gradient_progress['value'] = 0
+        self.train_log.config(state='normal')
+        self.train_log.delete('1.0', tk.END)
+        self.train_log.config(state='disabled')
         self.log_train("Starting training...\n")
 
         # Initialize time data
@@ -1174,7 +1320,7 @@ class QELM_GUI:
             self.time_data['remaining'] = 0
 
         # Start training in a separate thread
-        training_thread = threading.Thread(target=self.training_process, args=(epochs, num_threads))
+        training_thread = threading.Thread(target=self.training_process, args=(epochs, num_threads), daemon=True)
         training_thread.start()
 
     def training_process(self, epochs: int, num_threads: int):
@@ -1182,22 +1328,7 @@ class QELM_GUI:
         The actual training process running in a separate thread.
         """
         try:
-            def log_callback(msg):
-                self.log_train(msg)
-                if "Epoch" in msg and "/" in msg:
-                    # Update progress bar
-                    parts = msg.split()
-                    for p in parts:
-                        if "/" in p and "Epoch" not in p:
-                            try:
-                                current, total = p.split("/")
-                                current = int(current)
-                                total = int(total)
-                                percentage = (current / total) * 100
-                                self.update_progress(percentage)
-                            except:
-                                pass
-
+            self.log_train("Training thread started.\n")
             train_model(
                 self.model,
                 self.X,
@@ -1205,7 +1336,7 @@ class QELM_GUI:
                 epochs=epochs,
                 lr=self.optimizer.lr,
                 num_threads=num_threads,
-                log_callback=log_callback,
+                log_queue=self.log_queue,
                 stop_flag=self.stop_flag,
                 time_lock=self.time_lock,
                 time_data=self.time_data,
@@ -1225,7 +1356,8 @@ class QELM_GUI:
             self.load_button.config(state='normal')
             self.infer_button.config(state='normal')
             if not self.stop_flag.is_set():
-                self.progress['value'] = 100
+                self.epoch_progress['value'] = 100
+                self.gradient_progress['value'] = 100
 
             # Update evaluation metrics
             self.evaluate_model()
@@ -1310,7 +1442,7 @@ class QELM_GUI:
         self.log_infer(f"Running inference for '{input_token}' with max_length={max_length} and temperature={temperature}...\n")
 
         # Start inference in a separate thread
-        inference_thread = threading.Thread(target=self.inference_process, args=(input_token, max_length, temperature))
+        inference_thread = threading.Thread(target=self.inference_process, args=(input_token, max_length, temperature), daemon=True)
         inference_thread.start()
 
     def inference_process(self, input_token: str, max_length: int, temperature: float):
@@ -1368,13 +1500,6 @@ class QELM_GUI:
             self.token_map_display.insert(tk.END, f"{token}: {idx}\n")
         self.token_map_display.config(state='disabled')
 
-    def update_progress(self, percentage):
-        """
-        Update the training progress bar.
-        """
-        self.progress['value'] = percentage
-        self.master.update_idletasks()
-
     def update_resource_usage(self):
         """
         Update CPU usage and display GPU status.
@@ -1394,20 +1519,14 @@ class QELM_GUI:
         Update the elapsed and remaining training time.
         """
         with self.time_lock:
-            elapsed = time.time() - self.time_data['start_time'] if self.time_data.get('start_time', 0) > 0 else 0
+            elapsed = time.time() - self.time_data.get('start_time', 0)
             elapsed_str = f"{elapsed:.1f}s"
 
-            if self.time_data.get('epochs_done', 0) == 0 and self.time_data.get('epochs', 0) > 0:
-                remaining_str = "Estimating..."
+            remaining = self.time_data.get('remaining', 0)
+            if remaining > 0:
+                remaining_str = f"{remaining:.1f}s"
             else:
-                remaining = self.time_data.get('remaining', 0)
-                if remaining > 0:
-                    remaining_str = f"{remaining:.1f}s"
-                else:
-                    if 0 < self.time_data.get('epochs_done', 0) < self.time_data.get('epochs', 0):
-                        remaining_str = "Estimating..."
-                    else:
-                        remaining_str = "0s"
+                remaining_str = "Estimating..."
 
         self.time_label.config(text=f"Elapsed: {elapsed_str} | Remaining: {remaining_str}")
 
@@ -1421,18 +1540,18 @@ class QELM_GUI:
         # Compute Perplexity on training data
         perplexities = []
         for x, y in zip(self.X, self.Y):
-            logits = self.model.forward([x])
+            logits = self.model.forward([x], use_residual=True)
             perp = perplexity(logits, y)
             perplexities.append(perp)
         avg_perplexity = np.mean(perplexities)
 
         # Compute BLEU score (requires reference and hypothesis; simplistic implementation)
         # Here, we treat training data as reference and model's predictions as hypothesis
-        # This is not standard but serves demonstration purposes
+        # This is not standard but serves demonstration purposes so we know better what our models are capable of
         hypotheses = []
         references = []
         for x, y in zip(self.X, self.Y):
-            logits = self.model.forward([x])
+            logits = self.model.forward([x], use_residual=True)
             predicted = np.argmax(logits)
             hypotheses.append([self.id_to_token.get(predicted, "<UNK>")])
             references.append([self.id_to_token.get(y, "<UNK>")])
@@ -1459,9 +1578,10 @@ def main():
     except Exception as e:
         error_trace = traceback.format_exc()
         logging.critical(f"Unexpected error:\n{error_trace}")
+        # Create a hidden root to display the message box
         hidden_root = tk.Tk()
         hidden_root.withdraw()
-        messagebox.showerror("Unexpected Error", f"An unexpected error occurred:\n{e}")
+        messagebox.showerror("Unexpected Error", f"An unexpected error occurred:\n{e}\n\nCheck the log file for more details.")
         sys.exit(1)
 
 
