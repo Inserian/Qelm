@@ -90,7 +90,7 @@ def normalize_vector(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 # ============================
-# Quantum Neuron (20-Qubit Logical Unit)
+# Quantum Neuron (20-Qubit Logical Unit) *If changing, stay below 100 or degredation occurs.
 # ============================
 
 class QuantumNeuron:
@@ -150,7 +150,7 @@ class QuantumNeuron:
         return self.circuit.copy()
 
 # ============================
-# Graphene-Like Layer Structure
+# Graphene-Like Layer Structure *Lattice layers to remove quantum noise interference*
 # ============================
 
 class GrapheneLayer:
@@ -212,7 +212,7 @@ class GrapheneLayer:
         return self.circuit.copy()
 
 # ============================
-# Stacked Layers for Deep Network
+# Stacked Layers for Deep Network 
 # ============================
 
 class StackedLayers:
@@ -406,7 +406,7 @@ class QuantumLanguageModel:
             if token < num_qubits:
                 full_circuit.measure(token, token)
             else:
-                # For tokens beyond the number of qubits, map to the closest qubit
+                # For tokens beyond the number of qubits, map to the closest qubit *This shouldn't happen, but incase it does then this will need to be altered*
                 mapped_qubit = token % num_qubits
                 full_circuit.measure(mapped_qubit, token)
 
