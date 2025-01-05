@@ -14,7 +14,7 @@ import threading
 import multiprocessing
 import concurrent.futures
 from collections import defaultdict
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 import queue
 import subprocess
 import numpy as np
@@ -37,6 +37,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 nltk.download('punkt', quiet=True)
 
+# Configure Logging
 console = logging.StreamHandler()
 console.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -51,353 +52,702 @@ def normalize_vector(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 
-class QuantumParameterStore:
-    def __init__(self, size: int, prefix: str = "theta"):
-        self.size = size
-        self.parameters = [Parameter(f"{prefix}_{i}") for i in range(size)]
-        self.values = np.zeros(size, dtype=float)
-
-    def set_values(self, vals: np.ndarray):
-        if vals.shape[0] != self.size:
-            raise ValueError("Parameter size mismatch.")
-        self.values = vals.copy()
-
-    def get_values(self) -> np.ndarray:
-        return self.values.copy()
-
-    def to_dict(self) -> dict:
-        return {
-            "size": self.size,
-            "prefix": self.parameters[0].name.rsplit('_', 1)[0],
-            "values": self.values.tolist()
-        }
-
-    def from_dict(self, d: dict):
-        if d["size"] != self.size:
-            raise ValueError("Parameter size mismatch when loading parameters.")
-        self.set_values(np.array(d["values"], dtype=float))
+# --------------------------------------------------------------------
+# Spin Measurement Integration (Four Decimal Precision)
+# --------------------------------------------------------------------
+def measure_qubit_spin_z(qc: "QuantumChannel") -> float:
+    """
+    Measure the spin along the Z axis (expectation value) for the quantum circuit in qc.
+    Round to 4 decimal places. Returns a float in [-1.0, +1.0].
+    """
+    temp_circuit = qc.circuit.copy()
+    backend = qc.backend
+    job = backend.run(temp_circuit)
+    result = job.result()
+    statevector = result.get_statevector(temp_circuit)
+    alpha = np.abs(statevector[0])**2
+    beta = np.abs(statevector[1])**2
+    z_expectation = alpha - beta
+    return round(z_expectation, 4)
 
 
-class QuantumLayerBase:
-    def __init__(
-        self,
-        sim_method: str = 'cpu',
-        num_threads: int = 1,
-        enable_logging: bool = True,
-        use_advanced_ansatz: bool = False,
-        use_data_reuploading: bool = False
-    ):
-        self.sim_method = sim_method
-        self.num_threads = num_threads
-        self.enable_logging = enable_logging
-        self.use_advanced_ansatz = use_advanced_ansatz
-        self.use_data_reuploading = use_data_reuploading
-        self.backend = self.initialize_simulator()
+# --------------------------------------------------------------------
+# Existing Pseudo ExponentialSubwordTokenizer
+# --------------------------------------------------------------------
+class ExponentialSubwordTokenizer:
+    """
+    A pseudo subword tokenizer that can exponentially expand the token set
+    by identifying common subword units using a rudimentary approach.
+    In practice, you might replace this with an advanced technique such
+    as Byte-Pair Encoding (BPE), SentencePiece, or WordPiece.
 
-    def initialize_simulator(self):
-        if self.sim_method == 'gpu':
-            backend = AerSimulator(method='statevector', device='GPU', max_parallel_threads=self.num_threads)
-            if self.enable_logging:
-                logging.info(f"{self.__class__.__name__}: Using GPU.")
-        elif self.sim_method == 'both':
-            backend = AerSimulator(method='statevector', device='GPU', max_parallel_threads=self.num_threads)
-            if self.enable_logging:
-                logging.info(f"{self.__class__.__name__}: Using Both CPU and GPU.")
-        elif self.sim_method == 'simulation':
-            backend = None
-            if self.enable_logging:
-                logging.info(f"{self.__class__.__name__}: Using pure simulation mode (no circuit execution).")
-        else:
-            backend = AerSimulator(method='statevector', max_parallel_threads=self.num_threads)
-            if self.enable_logging:
-                logging.info(f"{self.__class__.__name__}: Using CPU.")
-        return backend
+    ENHANCED: 
+    - Optional punctuation handling to unify repeated punctuation and separate punctuation from words.
+    """
+    def __init__(self, vocab_size: int = 1000, min_subword_freq: int = 2, handle_punctuation: bool = True):
+        self.vocab_size = vocab_size
+        self.min_subword_freq = min_subword_freq
+        self.handle_punctuation = handle_punctuation
+        self.subword_vocab: Dict[str, int] = {}
+        self.special_tokens = ["<PAD>", "<START>", "<END>", "<UNK>"]
+        self.is_trained = False
 
-    def build_circuit(self, input_vector: np.ndarray, param_store: QuantumParameterStore) -> QuantumCircuit:
-        if self.use_advanced_ansatz:
-            circuit = self.build_advanced_circuit(input_vector, param_store)
-        else:
-            circuit = self.build_simple_circuit(input_vector, param_store)
-        return circuit
+    def train(self, corpus: List[str]):
+        from collections import defaultdict
+        import re
+        if self.handle_punctuation:
+            processed_corpus = []
+            for sentence in corpus:
+                sentence = re.sub(r'([^\w\s])\1+', r'\1', sentence)
+                sentence = re.sub(r'([^\w\s])', r' \1 ', sentence)
+                processed_corpus.append(sentence)
+            corpus = processed_corpus
 
-    def build_simple_circuit(self, input_vector: np.ndarray, param_store: QuantumParameterStore) -> QuantumCircuit:
-        qubits_needed = max(1, int(np.ceil(np.log2(len(input_vector)))))
-        circuit = QuantumCircuit(qubits_needed)
-        state_prep_vec = np.zeros(2**qubits_needed, dtype=complex)
-        state_prep_vec[:len(input_vector)] = input_vector.astype(complex)
-        state_prep_vec = normalize_vector(state_prep_vec)
-        circuit.initialize(state_prep_vec, qubits=range(qubits_needed))
-        num_layers = 2
-        for layer in range(num_layers):
-            for i in range(qubits_needed):
-                theta = param_store.values[layer * qubits_needed + i]
-                circuit.ry(theta, i)
-            for i in range(qubits_needed - 1):
-                circuit.cx(i, i + 1)
-        for i in range(qubits_needed):
-            theta = param_store.values[num_layers * qubits_needed + i]
-            circuit.ry(theta, i)
-        circuit.save_statevector()
-        return circuit
+        char_counts = defaultdict(int)
+        for token in self.special_tokens:
+            self.subword_vocab[token] = len(self.subword_vocab)
 
-    def build_advanced_circuit(self, input_vector: np.ndarray, param_store: QuantumParameterStore) -> QuantumCircuit:
-        qubits_needed = max(1, int(np.ceil(np.log2(len(input_vector)))))
-        circuit = QuantumCircuit(qubits_needed)
-        state_prep_vec = np.zeros(2**qubits_needed, dtype=complex)
-        state_prep_vec[:len(input_vector)] = input_vector.astype(complex)
-        state_prep_vec = normalize_vector(state_prep_vec)
-        circuit.initialize(state_prep_vec, qubits=range(qubits_needed))
-        layers = 2
-        offset = 0
-        for _ in range(layers):
-            for i in range(qubits_needed):
-                theta_ry = param_store.values[offset]
-                offset += 1
-                circuit.ry(theta_ry, i)
-                theta_rz = param_store.values[offset] if offset < param_store.size else 0
-                offset += 1
-                circuit.rz(theta_rz, i)
-                if self.use_data_reuploading:
-                    scaled_angle = float(input_vector[i % len(input_vector)]) * 0.1
-                    circuit.rx(scaled_angle, i)
-            for i in range(qubits_needed):
-                next_qubit = (i + 1) % qubits_needed
-                circuit.cx(i, next_qubit)
-        circuit.save_statevector()
-        return circuit
+        for sentence in corpus:
+            for ch in sentence:
+                char_counts[ch] += 1
 
-    def simulate(self, circuit: QuantumCircuit) -> np.ndarray:
-        if self.sim_method == 'simulation' or self.backend is None:
-            data = circuit.data
-            qubits_needed = circuit.num_qubits
-            if len(data) > 0 and data[0].operation.name == 'initialize':
-                init_vec = data[0].operation.params[0]
-                return init_vec
+        sorted_chars = sorted(char_counts.items(), key=lambda x: x[1], reverse=True)
+        for ch, freq in sorted_chars:
+            if ch not in self.subword_vocab and len(self.subword_vocab) < self.vocab_size:
+                self.subword_vocab[ch] = len(self.subword_vocab)
+
+        merges = True
+        while merges and len(self.subword_vocab) < self.vocab_size:
+            merges = False
+            pair_counts = defaultdict(int)
+            for sentence in corpus:
+                tokens = self.tokenize_line(sentence, fallback_char_level=True)
+                for i in range(len(tokens) - 1):
+                    pair = (tokens[i], tokens[i + 1])
+                    pair_counts[pair] += 1
+            if pair_counts:
+                frequent_pair, count = max(pair_counts.items(), key=lambda x: x[1])
+                if count >= self.min_subword_freq:
+                    new_subword = frequent_pair[0] + frequent_pair[1]
+                    if new_subword not in self.subword_vocab:
+                        self.subword_vocab[new_subword] = len(self.subword_vocab)
+                        merges = True
+        self.is_trained = True
+        logging.info(f"ExponentialSubwordTokenizer: Trained with vocab size {len(self.subword_vocab)}.")
+
+    def tokenize_line(self, text: str, fallback_char_level: bool = False) -> List[str]:
+        if not self.is_trained:
+            return list(text)
+        tokens = []
+        i = 0
+        while i < len(text):
+            match_found = False
+            for length in range(min(self.vocab_size, len(text) - i), 0, -1):
+                candidate = text[i : i + length]
+                if candidate in self.subword_vocab:
+                    tokens.append(candidate)
+                    i += length
+                    match_found = True
+                    break
+            if not match_found:
+                if fallback_char_level:
+                    tokens.append(text[i])
+                    i += 1
+                else:
+                    tokens.append("<UNK>")
+                    i += 1
+        return tokens
+
+    def encode(self, text: str) -> List[int]:
+        tokens = self.tokenize_line(text, fallback_char_level=True)
+        token_ids = [self.subword_vocab.get(tok, self.subword_vocab.get("<UNK>")) for tok in tokens]
+        return token_ids
+
+    def decode(self, token_ids: List[int]) -> str:
+        inv_vocab = {v: k for k, v in self.subword_vocab.items()}
+        subwords = []
+        for tid in token_ids:
+            subwords.append(inv_vocab.get(tid, "<UNK>"))
+        return "".join(subwords)
+
+    def get_vocab(self) -> Dict[str, int]:
+        return self.subword_vocab.copy()
+
+    def get_id_to_token_map(self) -> Dict[int, str]:
+        return {v: k for k, v in self.subword_vocab.items()}
+
+
+def load_dataset_with_exponential_tokenizer(file_path: str, vocab_size: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    import os
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File {file_path} does not exist.")
+    with open(file_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+
+    lines = text.split('\n')
+    tokenizer = ExponentialSubwordTokenizer(vocab_size=vocab_size, handle_punctuation=True)
+    tokenizer.train(lines)
+
+    all_ids = []
+    next_ids = []
+    for line in lines:
+        tokens_line = tokenizer.encode(line)
+        if len(tokens_line) < 2:
+            continue
+        for i in range(len(tokens_line) - 1):
+            all_ids.append(tokens_line[i])
+            next_ids.append(tokens_line[i + 1])
+
+    X = np.array(all_ids, dtype=np.int32)
+    Y = np.array(next_ids, dtype=np.int32)
+    id_to_token = tokenizer.get_id_to_token_map()
+    token_to_id = tokenizer.get_vocab()
+    return X, Y, token_to_id, id_to_token
+
+
+# --------------------------------------------------------------------
+# Byte-Pair Encoding (BPE) for improved tokenization
+# --------------------------------------------------------------------
+class BytePairEncodingTokenizer:
+    """
+    A more formal BPE tokenizer implementation.
+    Iteratively merges frequent pairs of tokens until vocabulary limit
+    or until no more merges are beneficial.
+    """
+    def __init__(self, vocab_size: int = 8000, min_freq_threshold: int = 2):
+        self.vocab_size = vocab_size
+        self.min_freq_threshold = min_freq_threshold
+        self.vocab: Dict[str, int] = {}
+        self.merges = []
+        self.special_tokens = ["<PAD>", "<START>", "<END>", "<UNK>"]
+        self.is_trained = False
+
+    def train(self, corpus: List[str]):
+        from collections import defaultdict
+        # Initialize vocabulary with special tokens
+        for token in self.special_tokens:
+            if token not in self.vocab:
+                self.vocab[token] = len(self.vocab)
+
+        # Convert each line into a list of characters + special end symbol
+        # Example: "cat" -> ['c', 'a', 't', '</w>']
+        corpus_tokens = []
+        for line in corpus:
+            chars = list(line.strip())
+            if chars:
+                corpus_tokens.append(chars + ["</w>"])  # using </w> to mark word boundaries
+
+        # Count initial frequency of token pairs
+        pair_freq = defaultdict(int)
+        for tokens in corpus_tokens:
+            for i in range(len(tokens) - 1):
+                pair_freq[(tokens[i], tokens[i + 1])] += 1
+
+        # Build merges until vocab_size
+        while len(self.vocab) < self.vocab_size and pair_freq:
+            # find the most frequent pair
+            best_pair, freq = max(pair_freq.items(), key=lambda x: x[1])
+            if freq < self.min_freq_threshold:
+                break
+            merged_symbol = best_pair[0] + best_pair[1]
+
+            # add to merges
+            if merged_symbol not in self.vocab:
+                self.vocab[merged_symbol] = len(self.vocab)
+            self.merges.append(best_pair)
+
+            # merge in corpus
+            new_pair_freq = defaultdict(int)
+            for idx, tokens in enumerate(corpus_tokens):
+                i = 0
+                new_tokens = []
+                while i < len(tokens):
+                    if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == best_pair:
+                        merged = merged_symbol
+                        new_tokens.append(merged)
+                        i += 2
+                    else:
+                        new_tokens.append(tokens[i])
+                        i += 1
+                corpus_tokens[idx] = new_tokens
+            # recalc frequencies
+            for tokens in corpus_tokens:
+                for i in range(len(tokens) - 1):
+                    new_pair_freq[(tokens[i], tokens[i + 1])] += 1
+            pair_freq = new_pair_freq
+        self.is_trained = True
+        logging.info(f"BPE: Trained with vocab size {len(self.vocab)} merges={len(self.merges)}.")
+
+    def encode(self, line: str) -> List[int]:
+        if not self.is_trained:
+            # fallback to naive char
+            return [self.vocab.get(ch, self.vocab.get("<UNK>")) for ch in list(line)]
+        tokens = list(line.strip()) + ["</w>"]
+        # merge iteratively
+        merges_applied = True
+        while merges_applied:
+            merges_applied = False
+            i = 0
+            new_tokens = []
+            while i < len(tokens):
+                if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) in self.merges:
+                    merged_symbol = tokens[i] + tokens[i + 1]
+                    new_tokens.append(merged_symbol)
+                    i += 2
+                    merges_applied = True
+                else:
+                    new_tokens.append(tokens[i])
+                    i += 1
+            tokens = new_tokens
+        return [self.vocab.get(tok, self.vocab.get("<UNK>")) for tok in tokens]
+
+    def decode(self, token_ids: List[int]) -> str:
+        inv_vocab = {v: k for k, v in self.vocab.items()}
+        symbols = [inv_vocab.get(tid, "<UNK>") for tid in token_ids]
+        word = "".join(symbols).replace("</w>", "")
+        return word
+
+    def get_vocab(self) -> Dict[str, int]:
+        return self.vocab.copy()
+
+    def get_id_to_token_map(self) -> Dict[int, str]:
+        return {v: k for k, v in self.vocab.items()}
+
+
+# --------------------------------------------------------------------
+# WordPiece Tokenizer (Basic outline)
+# --------------------------------------------------------------------
+class WordPieceTokenizer:
+    """
+    WordPiece as used in BERT. Uses a likelihood-based or frequency-based
+    approach to split words into subwords. This version is simplified and
+    uses a frequency-based method for merges.
+    """
+    def __init__(self, vocab_size=8000, min_freq=2):
+        self.vocab_size = vocab_size
+        self.min_freq = min_freq
+        self.special_tokens = ["<PAD>", "<START>", "<END>", "<UNK>"]
+        self.vocab: Dict[str, int] = {}
+        self.is_trained = False
+
+    def train(self, corpus: List[str]):
+        from collections import defaultdict
+        for token in self.special_tokens:
+            self.vocab[token] = len(self.vocab)
+        word_freq = defaultdict(int)
+        for line in corpus:
+            for word in line.split():
+                word_freq[word] += 1
+
+        # sort words by frequency
+        sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+        for word, freq in sorted_words:
+            if freq < self.min_freq:
+                continue
+            if len(self.vocab) >= self.vocab_size:
+                break
+            if word not in self.vocab:
+                self.vocab[word] = len(self.vocab)
+        self.is_trained = True
+        logging.info(f"WordPiece: Trained with vocab size {len(self.vocab)}.")
+
+    def encode(self, text: str) -> List[int]:
+        tokens = []
+        for word in text.split():
+            if word in self.vocab:
+                tokens.append(self.vocab[word])
             else:
-                return np.zeros(2**qubits_needed, dtype=complex)
+                # fallback subword splitting
+                sub_tokens = self._split_into_subwords(word)
+                tokens.extend(self.vocab.get(st, self.vocab.get("<UNK>")) for st in sub_tokens)
+        return tokens
+
+    def _split_into_subwords(self, word: str) -> List[str]:
+        # basic approach: keep dropping chars
+        subwords = []
+        start = 0
+        while start < len(word):
+            for end in range(len(word), start, -1):
+                piece = word[start:end]
+                if piece in self.vocab:
+                    subwords.append(piece)
+                    start = end
+                    break
+            else:
+                subwords.append("<UNK>")
+                break
+        return subwords
+
+    def decode(self, token_ids: List[int]) -> str:
+        inv_vocab = {v: k for k, v in self.vocab.items()}
+        return " ".join(inv_vocab.get(tid, "<UNK>") for tid in token_ids)
+
+    def get_vocab(self) -> Dict[str, int]:
+        return self.vocab.copy()
+
+    def get_id_to_token_map(self) -> Dict[int, str]:
+        return {v: k for k, v in self.vocab.items()}
+
+
+# --------------------------------------------------------------------
+# SentencePiece (Skeleton)
+# --------------------------------------------------------------------
+class SentencePieceTokenizer:
+    """
+    This is a skeleton example of how one might integrate SentencePiece
+    in Python code. Typically, you'd rely on an external library (sentencepiece)
+    SentencePiece can handle spaces as characters, and you can choose
+    BPE/unigram/etc. behind the scenes.
+    """
+    def __init__(self, vocab_size=8000, model_type='bpe'):
+        self.vocab_size = vocab_size
+        self.model_type = model_type
+        self.is_trained = False
+        self.sp = None  # stand-in for an actual sentencepiece processor
+
+    def train(self, corpus: List[str]):
+        # with real sentencepiece, you'd write data to a file, then train:
+        # spm.SentencePieceTrainer.Train('--input=corpus.txt --model_prefix=m --vocab_size=8000 --model_type=bpe')
+        # self.sp = spm.SentencePieceProcessor()
+        # self.sp.Load("m.model")
+        # This is a placeholder
+        self.is_trained = True
+        logging.info("SentencePiece: (placeholder) trained.")
+
+    def encode(self, text: str) -> List[int]:
+        # placeholder
+        if not self.is_trained:
+            return [0]*len(text.split())  # naive
+        # with real SP: return self.sp.EncodeAsIds(text)
+        return [1,2,3]
+
+    def decode(self, token_ids: List[int]) -> str:
+        # placeholder
+        return "decoded_text"
+
+    def get_vocab(self) -> Dict[str, int]:
+        return {"placeholder":0}
+
+    def get_id_to_token_map(self) -> Dict[int, str]:
+        return {0: "placeholder"}
+
+
+# --------------------------------------------------------------------
+# Contextual Tokenization (Outline)
+# --------------------------------------------------------------------
+class ContextualTokenizer:
+    """
+    Use a preliminary model or embedding to decide token splits.
+    Potentially can incorporate quantum state context, etc.
+    """
+    def __init__(self, base_tokenizer):
+        # base_tokenizer could be any of the above (BPE, WordPiece, etc.)
+        self.base_tokenizer = base_tokenizer
+        self.is_trained = False
+
+    def train(self, corpus: List[str], context_model=None):
+        """
+        context_model could be a classical or quantum-based model that
+        provides context embeddings or hints about word boundaries.
+        """
+        self.base_tokenizer.train(corpus)
+        # potential approach: refine merges using context
+        self.is_trained = True
+        logging.info("ContextualTokenizer: (placeholder) trained with base tokenizer context.")
+
+    def encode(self, text: str, context_embedding=None) -> List[int]:
+        # if context_embedding is used, adapt subword splits
+        # for now, just fallback
+        return self.base_tokenizer.encode(text)
+
+    def decode(self, token_ids: List[int]) -> str:
+        return self.base_tokenizer.decode(token_ids)
+
+
+# --------------------------------------------------------------------
+# Tokenization with Subword Regularization (high-level placeholder)
+# --------------------------------------------------------------------
+class SubwordRegularizationTokenizer:
+    """
+    Adds randomness to tokenization by sometimes picking alternate merges,
+    to reduce overfitting. This is typically done with libraries like
+    SentencePiece or others that can produce multiple segmentations.
+
+    We will produce multiple possible encodings and choose randomly.
+    """
+    def __init__(self, base_tokenizer, alpha=0.1):
+        self.base_tokenizer = base_tokenizer
+        self.alpha = alpha
+        self.is_trained = False
+
+    def train(self, corpus: List[str]):
+        self.base_tokenizer.train(corpus)
+        self.is_trained = True
+
+    def encode(self, text: str) -> List[int]:
+        # get normal encoding
+        base_ids = self.base_tokenizer.encode(text)
+        # artificially produce a "random" variant
+        # in a real scenario, you'd have multiple merges from the tokenizer
+        # we do a simple random approach
+        if np.random.rand() < self.alpha:
+            # e.g., replace a random token with <UNK>
+            if base_ids:
+                idx = np.random.randint(0, len(base_ids))
+                base_ids[idx] = self.base_tokenizer.base_tokenizer.vocab.get("<UNK>", 3)
+        return base_ids
+
+    def decode(self, token_ids: List[int]) -> str:
+        return self.base_tokenizer.decode(token_ids)
+
+
+# --------------------------------------------------------------------
+# Dynamic Vocabulary (simple illustration)
+# --------------------------------------------------------------------
+class DynamicVocabTokenizer:
+    """
+    Allows updating the tokenizer with new tokens on the fly, within a limit.
+    """
+    def __init__(self, base_tokenizer, vocab_update_limit=50):
+        self.base_tokenizer = base_tokenizer
+        self.vocab_update_limit = vocab_update_limit
+        self.updates_made = 0
+
+    def train(self, corpus: List[str]):
+        self.base_tokenizer.train(corpus)
+
+    def encode(self, text: str) -> List[int]:
+        tokens = []
+        for word in text.split():
+            if word not in self.base_tokenizer.get_vocab():
+                if self.updates_made < self.vocab_update_limit:
+                    # add new token
+                    current_vocab = self.base_tokenizer.get_vocab()
+                    new_id = len(current_vocab)
+                    current_vocab[word] = new_id
+                    self.base_tokenizer.vocab = current_vocab
+                    self.updates_made += 1
+            tokens.append(self.base_tokenizer.get_vocab().get(word, self.base_tokenizer.get_vocab().get("<UNK>")))
+        return tokens
+
+    def decode(self, token_ids: List[int]) -> str:
+        return self.base_tokenizer.decode(token_ids)
+
+
+# --------------------------------------------------------------------
+# QuantumChannel & Manager
+# --------------------------------------------------------------------
+class QuantumChannel:
+    def __init__(self, label: str = "Qc", decimal_precision: Optional[int] = None):
+        self.label = label
+        self.value = 0.0
+        self.num_qubits = 1
+        self.circuit = QuantumCircuit(self.num_qubits)
+        self.parameters = [Parameter(f"{self.label}_theta")]
+        self.backend = AerSimulator(method='statevector')
+        self.decimal_precision = decimal_precision
+        logging.info(f"Initialized {self.label} with {self.num_qubits} qubit(s).")
+
+    def encode(self, value: float):
+        if self.decimal_precision is not None and self.decimal_precision >= 0:
+            self.value = round(float(np.clip(value, 0.0, 1.0)), self.decimal_precision)
         else:
-            job = self.backend.run(circuit, shots=1)
-            result = job.result()
-            final_state = result.get_statevector(circuit)
-            return final_state.data
+            self.value = float(np.clip(value, 0.0, 1.0))
+        theta = float(2 * np.arcsin(np.sqrt(self.value)))
+        self.circuit = QuantumCircuit(self.num_qubits)
+        self.circuit.ry(theta, 0)
+        self.circuit.save_statevector()
+        logging.debug(f"{self.label} encoded with value {self.value} (theta={theta:.4f}).")
+
+    def decode(self) -> float:
+        job = self.backend.run(self.circuit)
+        result = job.result()
+        statevector = result.get_statevector(self.circuit)
+        alpha = np.abs(statevector[0])**2
+        decoded_value = alpha
+        logging.debug(f"{self.label} decoded with value {decoded_value:.4f}.")
+        return decoded_value
+
+    def apply_gate(self, gate: str, params: Optional[list] = None):
+        if gate.upper() == 'RY' and params:
+            theta = float(params[0])
+            self.circuit.ry(theta, 0)
+            logging.debug(f"{self.label}: Applied RY gate with theta={theta:.4f}.")
+        elif gate.upper() == 'RZ' and params:
+            theta = float(params[0])
+            self.circuit.rz(theta, 0)
+            logging.debug(f"{self.label}: Applied RZ gate with theta={theta:.4f}.")
+        elif gate.upper() == 'CX' and params:
+            pass
+
+    def reset(self):
+        self.circuit = QuantumCircuit(self.num_qubits)
+        self.circuit.reset(0)
+        self.circuit.save_statevector()
+        self.value = 0.0
+        logging.debug(f"{self.label} has been reset.")
 
 
-class QuantumAttentionLayer(QuantumLayerBase):
-    def __init__(
-        self, 
-        embed_dim: int, 
-        num_heads: int, 
-        sim_method: str = 'cpu', 
-        num_threads: int = 1,
-        prefix: str = "attn", 
-        enable_logging: bool = True,
-        use_advanced_ansatz: bool = False,
-        use_data_reuploading: bool = False
-    ):
-        super().__init__(
-            sim_method=sim_method,
-            num_threads=num_threads,
-            enable_logging=enable_logging,
-            use_advanced_ansatz=use_advanced_ansatz,
-            use_data_reuploading=use_data_reuploading
-        )
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        if self.head_dim * num_heads != embed_dim:
-            raise ValueError("embed_dim must be divisible by num_heads.")
-        shared_size = (embed_dim * embed_dim) // num_heads
-        self.query_params = QuantumParameterStore(shared_size, prefix=f"{prefix}_Q")
-        self.key_params = QuantumParameterStore(shared_size, prefix=f"{prefix}_K")
-        self.value_params = QuantumParameterStore(shared_size, prefix=f"{prefix}_V")
-        self.out_params = QuantumParameterStore(shared_size, prefix=f"{prefix}_O")
+class QuantumChannelManager:
+    def __init__(self):
+        self.channels: List[QuantumChannel] = []
+        self.available_indices: List[int] = []
+        self.lock = threading.Lock()
+        logging.info("Initialized QuantumChannelManager.")
 
-    def forward(self, input_vector: np.ndarray, mode: str = 'query') -> np.ndarray:
-        input_vector = normalize_vector(input_vector)
-        if mode == 'query':
-            param_store = self.query_params
-        elif mode == 'key':
-            param_store = self.key_params
-        elif mode == 'value':
-            param_store = self.value_params
-        elif mode == 'out':
-            param_store = self.out_params
-        else:
-            raise ValueError("Invalid mode for Attention forward.")
-        circuit = self.build_circuit(input_vector, param_store)
-        final_state = self.simulate(circuit)
-        output_length = self.embed_dim
-        if len(final_state) < output_length:
-            output_vec = np.real(final_state[:len(final_state)])
-            output_vec = np.pad(output_vec, (0, output_length - len(output_vec)), 'constant')
-        else:
-            output_vec = np.real(final_state[:output_length])
-        return normalize_vector(output_vec)
+    def create_channels(self, num_channels: int, decimal_precision: Optional[int] = None):
+        with self.lock:
+            for i in range(num_channels):
+                qc = QuantumChannel(label=f"Qc_{len(self.channels)+1}", decimal_precision=decimal_precision)
+                self.channels.append(qc)
+                self.available_indices.append(len(self.channels) - 1)
+                logging.info(f"Created {qc.label}.")
 
-    def get_all_parameters(self) -> np.ndarray:
-        return np.concatenate([
-            self.query_params.get_values(),
-            self.key_params.get_values(),
-            self.value_params.get_values(),
-            self.out_params.get_values()
-        ])
+    def allocate_channels(self, num_required: int) -> List[QuantumChannel]:
+        with self.lock:
+            if num_required > len(self.available_indices):
+                raise ValueError("Not enough available Quantum Channels to allocate.")
+            allocated = []
+            for _ in range(num_required):
+                index = self.available_indices.pop(0)
+                allocated.append(self.channels[index])
+                logging.info(f"Allocated {self.channels[index].label}.")
+            return allocated
 
-    def set_all_parameters(self, params: np.ndarray):
-        attn_size = (
-            self.query_params.size + 
-            self.key_params.size + 
-            self.value_params.size + 
-            self.out_params.size
-        )
-        if params.shape[0] != attn_size:
-            raise ValueError("Param size mismatch in Attention.")
-        q_size = self.query_params.size
-        k_size = self.key_params.size
-        v_size = self.value_params.size
-        o_size = self.out_params.size
-        self.query_params.set_values(params[:q_size])
-        self.key_params.set_values(params[q_size:q_size + k_size])
-        self.value_params.set_values(params[q_size + k_size:q_size + k_size + v_size])
-        self.out_params.set_values(params[q_size + k_size + v_size:])
+    def release_channels(self, allocated_channels: List[QuantumChannel]):
+        with self.lock:
+            for qc in allocated_channels:
+                index = self.channels.index(qc)
+                if index not in self.available_indices:
+                    self.available_indices.append(index)
+                    logging.info(f"Released {qc.label} back to pool.")
 
-    def to_dict(self) -> dict:
-        return {
-            "embed_dim": self.embed_dim,
-            "num_heads": self.num_heads,
-            "query_params": self.query_params.to_dict(),
-            "key_params": self.key_params.to_dict(),
-            "value_params": self.value_params.to_dict(),
-            "out_params": self.out_params.to_dict(),
-            "sim_method": self.sim_method,
-            "num_threads": self.num_threads,
-            "use_advanced_ansatz": self.use_advanced_ansatz,
-            "use_data_reuploading": self.use_data_reuploading
-        }
-
-    def from_dict(self, d: dict):
-        if d["embed_dim"] != self.embed_dim or d["num_heads"] != self.num_heads:
-            raise ValueError("Attention config mismatch.")
-        self.query_params.from_dict(d["query_params"])
-        self.key_params.from_dict(d["key_params"])
-        self.value_params.from_dict(d["value_params"])
-        self.out_params.from_dict(d["out_params"])
-        self.sim_method = d.get("sim_method", "cpu")
-        self.num_threads = d.get("num_threads", 1)
-        self.use_advanced_ansatz = d.get("use_advanced_ansatz", False)
-        self.use_data_reuploading = d.get("use_data_reuploading", False)
-        self.backend = self.initialize_simulator()
+    def get_all_channels(self) -> List[QuantumChannel]:
+        with self.lock:
+            return self.channels.copy()
 
 
-class QuantumFeedForwardLayer(QuantumLayerBase):
-    def __init__(
-        self, 
-        embed_dim: int, 
-        hidden_dim: int,
-        sim_method: str = 'cpu', 
-        num_threads: int = 1,
-        prefix: str = "ffn", 
-        enable_logging: bool = True,
-        use_advanced_ansatz: bool = False,
-        use_data_reuploading: bool = False
-    ):
-        super().__init__(
-            sim_method=sim_method,
-            num_threads=num_threads,
-            enable_logging=enable_logging,
-            use_advanced_ansatz=use_advanced_ansatz,
-            use_data_reuploading=use_data_reuploading
-        )
-        self.embed_dim = embed_dim
-        self.hidden_dim = hidden_dim
-        shared_size = (embed_dim * hidden_dim) // 2
-        self.w1_params = QuantumParameterStore(shared_size, prefix=f"{prefix}_W1")
-        self.w2_params = QuantumParameterStore(shared_size, prefix=f"{prefix}_W2")
+class SubBitDecoder:
+    def __init__(self, manager: QuantumChannelManager):
+        self.manager = manager
+        self.num_qubits = 1
+        self.backend = AerSimulator(method='statevector')
+        logging.info("Initialized SubBitDecoder.")
 
-    def forward(self, input_vector: np.ndarray, layer: str = 'w1') -> np.ndarray:
-        input_vector = normalize_vector(input_vector)
-        if layer == 'w1':
-            param_store = self.w1_params
-            output_length = self.hidden_dim
-        elif layer == 'w2':
-            param_store = self.w2_params
-            output_length = self.embed_dim
-        else:
-            raise ValueError("Invalid layer in FFN forward.")
-        circuit = self.build_circuit(input_vector, param_store)
-        final_state = self.simulate(circuit)
-        if len(final_state) < output_length:
-            output_vec = np.real(final_state[:len(final_state)])
-            output_vec = np.pad(output_vec, (0, output_length - len(output_vec)), 'constant')
-        else:
-            output_vec = np.real(final_state[:output_length])
-        return normalize_vector(output_vec)
+    def decode_and_transform(self, 
+                             allocated_channels: List[QuantumChannel],
+                             transform_function: Callable[[QuantumCircuit, Optional[dict]], QuantumCircuit],
+                             params: Optional[dict] = None) -> List[float]:
+        aggregated_value = sum(qc.decode() for qc in allocated_channels)
+        normalized_value = np.clip(aggregated_value, 0.0, 1.0)
+        logging.debug(f"SubBitDecoder: Aggregated value: {aggregated_value} -> {normalized_value}")
 
-    def get_all_parameters(self) -> np.ndarray:
-        return np.concatenate([self.w1_params.get_values(), self.w2_params.get_values()])
+        circuit = QuantumCircuit(self.num_qubits)
+        theta = float(2 * np.arcsin(np.sqrt(normalized_value)))
+        circuit.ry(theta, 0)
+        logging.debug(f"SubBitDecoder: Initialized qubit with RY({theta:.4f}).")
 
-    def set_all_parameters(self, params: np.ndarray):
-        ffn_size = self.w1_params.size + self.w2_params.size
-        if params.shape[0] != ffn_size:
-            raise ValueError("FFN param size mismatch.")
-        w1_size = self.w1_params.size
-        self.w1_params.set_values(params[:w1_size])
-        self.w2_params.set_values(params[w1_size:])
+        circuit = transform_function(circuit, params)
+        circuit.save_statevector()
+        job = self.backend.run(circuit)
+        result = job.result()
+        statevector = result.get_statevector(circuit)
+        alpha = np.abs(statevector[0])**2
+        beta = np.abs(statevector[1])**2
+        logging.debug(f"SubBitDecoder: alpha={alpha:.4f}, beta={beta:.4f}")
 
-    def to_dict(self) -> dict:
-        return {
-            "embed_dim": self.embed_dim,
-            "hidden_dim": self.hidden_dim,
-            "w1_params": self.w1_params.to_dict(),
-            "w2_params": self.w2_params.to_dict(),
-            "sim_method": self.sim_method,
-            "num_threads": self.num_threads,
-            "use_advanced_ansatz": self.use_advanced_ansatz,
-            "use_data_reuploading": self.use_data_reuploading
-        }
-
-    def from_dict(self, d: dict):
-        if d["embed_dim"] != self.embed_dim or d["hidden_dim"] != self.hidden_dim:
-            raise ValueError("FFN config mismatch.")
-        self.w1_params.from_dict(d["w1_params"])
-        self.w2_params.from_dict(d["w2_params"])
-        self.sim_method = d.get("sim_method", "cpu")
-        self.num_threads = d.get("num_threads", 1)
-        self.use_advanced_ansatz = d.get("use_advanced_ansatz", False)
-        self.use_data_reuploading = d.get("use_data_reuploading", False)
-        self.backend = self.initialize_simulator()
+        decoded_value = alpha
+        logging.debug(f"SubBitDecoder: Decoded value: {decoded_value:.4f}")
+        return [decoded_value]
 
 
-class AdamOptimizer:
-    def __init__(self, parameters: np.ndarray, lr: float = 0.001, betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-8):
-        self.parameters = parameters
-        self.lr = lr
-        self.betas = betas
-        self.eps = eps
-        self.m = np.zeros_like(self.parameters)
-        self.v = np.zeros_like(self.parameters)
-        self.t = 0
+class GroverOracle:
+    def __init__(self, target_state: str):
+        self.target_state = target_state
+        self.num_qubits = len(target_state)
+        self.circuit = QuantumCircuit(self.num_qubits)
+        self.build_oracle()
 
-    def step(self, gradients: np.ndarray):
-        self.t += 1
-        self.m = self.betas[0] * self.m + (1 - self.betas[0]) * gradients
-        self.v = self.betas[1] * self.v + (1 - self.betas[1]) * (gradients ** 2)
-        m_hat = self.m / (1 - self.betas[0] ** self.t)
-        v_hat = self.v / (1 - self.betas[1] ** self.t)
-        update = self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
-        self.parameters -= update
-        return self.parameters
+    def build_oracle(self):
+        for i, bit in enumerate(self.target_state):
+            if bit == '0':
+                self.circuit.x(i)
+        self.circuit.h(self.num_qubits - 1)
+        self.circuit.mct(list(range(self.num_qubits - 1)), self.num_qubits - 1)
+        self.circuit.h(self.num_qubits - 1)
+        for i, bit in enumerate(self.target_state):
+            if bit == '0':
+                self.circuit.x(i)
+        self.circuit.barrier()
 
-
-class AdvancedQuantumOptimizer:
-    def __init__(self, parameters: np.ndarray, lr: float = 0.001):
-        self.parameters = parameters
-        self.lr = lr
-
-    def step(self, gradients: np.ndarray):
-        self.parameters -= self.lr * gradients
-        return self.parameters
+    def get_oracle(self) -> QuantumCircuit:
+        return self.circuit
 
 
+class GroverDiffuser:
+    def __init__(self, num_qubits: int):
+        self.num_qubits = num_qubits
+        self.circuit = QuantumCircuit(self.num_qubits)
+        self.build_diffuser()
+
+    def build_diffuser(self):
+        self.circuit.h(range(self.num_qubits))
+        self.circuit.x(range(self.num_qubits))
+        self.circuit.h(self.num_qubits - 1)
+        self.circuit.mct(list(range(self.num_qubits - 1)), self.num_qubits - 1)
+        self.circuit.h(self.num_qubits - 1)
+        self.circuit.x(range(self.num_qubits))
+        self.circuit.h(range(self.num_qubits))
+        self.circuit.barrier()
+
+    def get_diffuser(self) -> QuantumCircuit:
+        return self.circuit
+
+
+class GroverSearch:
+    def __init__(self, target_state: str):
+        self.oracle = GroverOracle(target_state)
+        self.num_qubits = self.oracle.num_qubits
+        self.diffuser = GroverDiffuser(self.num_qubits)
+        self.circuit = QuantumCircuit(self.num_qubits, self.num_qubits)
+        self.build_circuit()
+        self.backend = AerSimulator(method='statevector')
+
+    def build_circuit(self):
+        self.circuit.h(range(self.num_qubits))
+        iterations = int((np.pi/4) * np.sqrt(2**self.num_qubits))
+        for _ in range(iterations):
+            self.circuit.append(self.oracle.get_oracle(), range(self.num_qubits))
+            self.circuit.append(self.diffuser.get_diffuser(), range(self.num_qubits))
+        self.circuit.measure(range(self.num_qubits), range(self.num_qubits))
+
+    def run(self) -> dict:
+        job = self.backend.run(self.circuit, shots=1024)
+        result = job.result()
+        counts = result.get_counts(self.circuit)
+        return counts
+
+
+class QuantumTokenSearcher:
+    def __init__(self, model, manager: QuantumChannelManager):
+        self.model = model
+        self.manager = manager
+
+    def search_tokens(self, query: str) -> List[str]:
+        binary_query = ''.join(['1' if char == 'a' else '0' for char in query.lower()])
+        binary_query = binary_query.ljust(int(np.ceil(len(binary_query)/self.model.num_blocks)), '0')
+        grover = GroverSearch(target_state=binary_query[:self.model.num_blocks])
+        counts = grover.run()
+        sorted_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        top_states = [state for state, count in sorted_counts[:5]]
+        token_indices = [int(state, 2) for state in top_states if int(state, 2) < self.model.vocab_size]
+        tokens = [self.model.id_to_token.get(idx, "<UNK>") for idx in token_indices]
+        return tokens
+
+
+# --------------------------------------------------------------------
+# Quantum Transformer Block (example usage)
+# --------------------------------------------------------------------
 class QuantumTransformerBlock:
     def __init__(
         self,
@@ -409,7 +759,9 @@ class QuantumTransformerBlock:
         block_prefix: str = "block",
         enable_logging: bool = True,
         use_advanced_ansatz: bool = False,
-        use_data_reuploading: bool = False
+        use_data_reuploading: bool = False,
+        qc_manager: QuantumChannelManager = None,
+        decoder: SubBitDecoder = None
     ):
         self.attn = QuantumAttentionLayer(
             embed_dim, 
@@ -434,23 +786,67 @@ class QuantumTransformerBlock:
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.qc_manager = qc_manager
+        self.decoder = decoder
+        self.token_searcher = QuantumTokenSearcher(model=None, manager=self.qc_manager)
+        logging.info(f"Initialized QuantumTransformerBlock '{block_prefix}' with Qc integration.")
 
     def forward(self, x: np.ndarray, use_residual: bool = True) -> np.ndarray:
-        attn_output_query = self.attn.forward(x, mode='query')
-        attn_output_key = self.attn.forward(x, mode='key')
-        attn_output_value = self.attn.forward(x, mode='value')
-        attn_output_out = self.attn.forward(x, mode='out')
-        attn_output = attn_output_query + attn_output_key + attn_output_value + attn_output_out
+        x = x.astype(float).flatten()
+        allocated_qcs = self.qc_manager.allocate_channels(self.num_heads)
+        logging.debug(f"QuantumTransformerBlock: Allocated {len(allocated_qcs)} Qc's for attention.")
+
+        for qc, value in zip(allocated_qcs, x):
+            if isinstance(value, np.ndarray):
+                if value.size == 1:
+                    scalar_value = float(value.item())
+                else:
+                    raise ValueError(f"Expected scalar value for encoding, got array size {value.size}")
+            else:
+                scalar_value = float(value)
+            qc.encode(scalar_value)
+
+        def attention_transform(circuit: QuantumCircuit, params: Optional[dict]) -> QuantumCircuit:
+            theta = params.get('theta_rz', np.pi / 4)
+            circuit.rz(float(theta), 0)
+            return circuit
+
+        attn_output = self.decoder.decode_and_transform(
+            allocated_channels=allocated_qcs,
+            transform_function=attention_transform,
+            params={'theta_rz': np.pi / 4}
+        )
+        attn_output = float(attn_output[0])
+        self.qc_manager.release_channels(allocated_qcs)
+
         if use_residual:
             x = normalize_vector(x + attn_output)
         else:
             x = attn_output
-        ffn_output_w1 = self.ffn.forward(x, layer='w1')
-        ffn_output_w2 = self.ffn.forward(ffn_output_w1, layer='w2')
+
+        allocated_qcs_ffn = self.qc_manager.allocate_channels(2)
+        split_size = len(x) // 2
+        values_to_encode = [float(x[i * split_size:(i + 1) * split_size].mean()) for i in range(2)]
+        for qc, value in zip(allocated_qcs_ffn, values_to_encode):
+            qc.encode(value)
+
+        def ffn_transform(circuit: QuantumCircuit, params: Optional[dict]) -> QuantumCircuit:
+            theta = params.get('theta_ry', np.pi / 6)
+            circuit.ry(float(theta), 0)
+            return circuit
+
+        ffn_output = self.decoder.decode_and_transform(
+            allocated_channels=allocated_qcs_ffn,
+            transform_function=ffn_transform,
+            params={'theta_ry': np.pi / 6}
+        )
+        ffn_output = float(ffn_output[0])
+        self.qc_manager.release_channels(allocated_qcs_ffn)
+
         if use_residual:
-            x = normalize_vector(x + ffn_output_w2)
+            x = normalize_vector(x + ffn_output)
         else:
-            x = ffn_output_w2
+            x = ffn_output
         return x
 
     def get_all_parameters(self) -> np.ndarray:
@@ -475,52 +871,9 @@ class QuantumTransformerBlock:
         self.ffn.from_dict(d["ffn"])
 
 
-class QuantumContextModule:
-    def __init__(self):
-        self.conversation_states = []
-
-    def store_state(self, quantum_state: np.ndarray):
-        self.conversation_states.append(quantum_state)
-
-    def clear_states(self):
-        self.conversation_states = []
-
-    def get_aggregated_context(self) -> np.ndarray:
-        if not self.conversation_states:
-            return None
-        stacked = np.vstack(self.conversation_states)
-        avg_state = np.mean(stacked, axis=0)
-        return normalize_vector(avg_state)
-
-
-class QuantumPositionalEncoding:
-    def apply_encoding(self, input_state: np.ndarray, position: int) -> np.ndarray:
-        alpha = 0.05
-        phase_factor = np.exp(1j * alpha * position)
-        encoded_state = input_state * phase_factor
-        return encoded_state
-
-
-class QuantumKnowledgeEmbedding:
-    def __init__(self, knowledge_dim: int):
-        self.knowledge_dim = knowledge_dim
-        self.knowledge_matrix = np.random.randn(knowledge_dim, knowledge_dim)
-
-    def retrieve_knowledge_state(self, query: np.ndarray) -> np.ndarray:
-        retrieval = self.knowledge_matrix @ query
-        return normalize_vector(retrieval)
-
-
-def quantum_data_augmentation(input_data: np.ndarray) -> np.ndarray:
-    noise_level = 0.001
-    noisy_data = input_data + noise_level * np.random.randn(*input_data.shape)
-    return normalize_vector(noisy_data)
-
-
-def quantum_batch_shift_training(model, X, Y, batch_size=32, lr=0.001):
-    pass
-
-
+# --------------------------------------------------------------------
+# QuantumLanguageModel
+# --------------------------------------------------------------------
 class QuantumLanguageModel:
     def __init__(
         self,
@@ -537,7 +890,9 @@ class QuantumLanguageModel:
         use_context=False,
         use_positional_encoding=False,
         use_knowledge_embedding=False,
-        knowledge_dim=0
+        knowledge_dim=0,
+        manager: QuantumChannelManager = None,
+        decoder: SubBitDecoder = None
     ):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -545,6 +900,7 @@ class QuantumLanguageModel:
         self.hidden_dim = hidden_dim
         self.embeddings = (np.random.randn(vocab_size, embed_dim) * 0.01).astype(np.float32)
         self.blocks = []
+        self.manager = manager if manager else QuantumChannelManager()
         if num_blocks > 1:
             for b in range(num_blocks):
                 block_prefix = f"layer{b+1}"
@@ -557,7 +913,9 @@ class QuantumLanguageModel:
                     block_prefix=block_prefix,
                     enable_logging=enable_logging,
                     use_advanced_ansatz=use_advanced_ansatz,
-                    use_data_reuploading=use_data_reuploading
+                    use_data_reuploading=use_data_reuploading,
+                    qc_manager=self.manager,
+                    decoder=decoder
                 )
                 self.blocks.append(block)
         else:
@@ -601,6 +959,9 @@ class QuantumLanguageModel:
             self.knowledge_module = QuantumKnowledgeEmbedding(knowledge_dim)
         else:
             self.knowledge_module = None
+        self.qc_manager = self.manager
+        self.decoder = decoder if decoder else SubBitDecoder(self.qc_manager)
+        self.token_searcher = QuantumTokenSearcher(model=self, manager=self.qc_manager)
 
     def _initialize_quantum_params(self):
         scale = 0.1
@@ -638,21 +999,21 @@ class QuantumLanguageModel:
             for block in self.blocks:
                 x = block.forward(x, use_residual=use_residual)
         else:
-            attn_output_query = self.attn.forward(x, mode='query')
-            attn_output_key = self.attn.forward(x, mode='key')
-            attn_output_value = self.attn.forward(x, mode='value')
-            attn_output_out = self.attn.forward(x, mode='out')
-            attn_output = attn_output_query + attn_output_key + attn_output_value + attn_output_out
+            attn_query = self.attn.forward(x, mode='query')
+            attn_key = self.attn.forward(x, mode='key')
+            attn_value = self.attn.forward(x, mode='value')
+            attn_out = self.attn.forward(x, mode='out')
+            attn_output = attn_query + attn_key + attn_value + attn_out
             if use_residual:
                 x = normalize_vector(x + attn_output)
             else:
                 x = attn_output
-            ffn_output_w1 = self.ffn.forward(x, layer='w1')
-            ffn_output_w2 = self.ffn.forward(ffn_output_w1, layer='w2')
+            ffn_w1 = self.ffn.forward(x, layer='w1')
+            ffn_w2 = self.ffn.forward(ffn_w1, layer='w2')
             if use_residual:
-                x = normalize_vector(x + ffn_output_w2)
+                x = normalize_vector(x + ffn_w2)
             else:
-                x = ffn_output_w2
+                x = ffn_w2
         logits = self.W_out @ x
         if self.context_module and logits is not None:
             self.context_module.store_state(logits)
@@ -683,8 +1044,8 @@ class QuantumLanguageModel:
                 size_block = len(block.get_all_parameters())
                 block_sizes.append(size_block)
                 total_block_params += size_block
-            proj_size = self.embed_dim * self.hidden_dim
-            out_size = self.vocab_size * self.embed_dim
+            proj_size = (self.embed_dim * self.hidden_dim)
+            out_size = (self.vocab_size * self.embed_dim)
             expected = total_block_params + proj_size + out_size
             if params.shape[0] != expected:
                 raise ValueError(f"Parameter mismatch. Expected {expected}, got {params.shape[0]}.")
@@ -699,9 +1060,9 @@ class QuantumLanguageModel:
             self.W_out = params[offset: offset + out_size].reshape(self.vocab_size, self.embed_dim)
         else:
             attn_size = (
-                self.attn.query_params.size + 
+                self.attn.query_params.size +
                 self.attn.key_params.size +
-                self.attn.value_params.size + 
+                self.attn.value_params.size +
                 self.attn.out_params.size
             )
             ffn_size = self.ffn.w1_params.size + self.ffn.w2_params.size
@@ -711,9 +1072,12 @@ class QuantumLanguageModel:
             if params.shape[0] != expected:
                 raise ValueError(f"Parameter mismatch. Expected {expected}, got {params.shape[0]}.")
             self.attn.set_all_parameters(params[:attn_size])
-            self.ffn.set_all_parameters(params[attn_size:attn_size + ffn_size])
-            self.W_proj = params[attn_size + ffn_size:attn_size + ffn_size + proj_size].reshape(self.embed_dim, self.hidden_dim)
+            self.ffn.set_all_parameters(params[attn_size: attn_size + ffn_size])
+            self.W_proj = params[attn_size + ffn_size: attn_size + ffn_size + proj_size].reshape(self.embed_dim, self.hidden_dim)
             self.W_out = params[attn_size + ffn_size + proj_size:].reshape(self.vocab_size, self.embed_dim)
+
+    def search_related_tokens(self, query: str) -> List[str]:
+        return self.token_searcher.search_tokens(query)
 
     def to_dict(self) -> dict:
         model_dict = {
@@ -780,7 +1144,11 @@ class QuantumLanguageModel:
                     sim_method='cpu',
                     num_threads=1,
                     block_prefix=block_prefix,
-                    enable_logging=False
+                    enable_logging=False,
+                    use_advanced_ansatz=False,
+                    use_data_reuploading=False,
+                    qc_manager=self.manager,
+                    decoder=self.decoder
                 )
                 new_block.from_dict(block_info)
                 self.blocks.append(new_block)
@@ -795,6 +1163,7 @@ class QuantumLanguageModel:
         logging.info(f"Model saved to {save_path}")
 
     def load_model(self, load_path: str):
+        import os
         if not os.path.exists(load_path):
             raise FileNotFoundError(f"File {load_path} does not exist.")
         with open(load_path, 'r') as f:
@@ -813,6 +1182,219 @@ class QuantumLanguageModel:
         self.shift_parameter(param_index, -shift)
 
 
+class QuantumContextModule:
+    def __init__(self):
+        self.conversation_states = []
+
+    def store_state(self, quantum_state: np.ndarray):
+        self.conversation_states.append(quantum_state)
+
+    def clear_states(self):
+        self.conversation_states = []
+
+    def get_aggregated_context(self) -> np.ndarray:
+        if not self.conversation_states:
+            return None
+        stacked = np.vstack(self.conversation_states)
+        avg_state = np.mean(stacked, axis=0)
+        return normalize_vector(avg_state)
+
+
+class QuantumPositionalEncoding:
+    def apply_encoding(self, input_state: np.ndarray, position: int) -> np.ndarray:
+        alpha = 0.05
+        phase_factor = np.exp(1j * alpha * position)
+        encoded_state = input_state * phase_factor
+        return encoded_state
+
+
+class QuantumKnowledgeEmbedding:
+    def __init__(self, knowledge_dim: int):
+        self.knowledge_dim = knowledge_dim
+        self.knowledge_matrix = np.random.randn(knowledge_dim, knowledge_dim)
+
+    def retrieve_knowledge_state(self, query: np.ndarray) -> np.ndarray:
+        retrieval = self.knowledge_matrix @ query
+        return normalize_vector(retrieval)
+
+
+def quantum_data_augmentation(input_data: np.ndarray) -> np.ndarray:
+    noise_level = 0.001
+    noisy_data = input_data + noise_level * np.random.randn(*input_data.shape)
+    return normalize_vector(noisy_data)
+
+
+def quantum_batch_shift_training(model, X, Y, batch_size=32, lr=0.001):
+    pass
+
+
+class QuantumParameterStore:
+    def __init__(self, size: int, prefix: str = "theta"):
+        self.size = size
+        self.parameters = [Parameter(f"{prefix}_{i}") for i in range(size)]
+        self.values = np.zeros(size, dtype=float)
+
+    def set_values(self, vals: np.ndarray):
+        if vals.shape[0] != self.size:
+            raise ValueError("Parameter size mismatch.")
+        self.values = vals.copy()
+
+    def get_values(self) -> np.ndarray:
+        return self.values.copy()
+
+    def to_dict(self) -> dict:
+        return {
+            "size": self.size,
+            "prefix": self.parameters[0].name.rsplit('_', 1)[0],
+            "values": self.values.tolist()
+        }
+
+    def from_dict(self, d: dict):
+        if d["size"] != self.size:
+            raise ValueError("Parameter size mismatch when loading parameters.")
+        self.set_values(np.array(d["values"], dtype=float))
+
+
+class QuantumLayerBase:
+    def __init__(
+        self,
+        sim_method: str = 'cpu',
+        num_threads: int = 1,
+        enable_logging: bool = True,
+        use_advanced_ansatz: bool = False,
+        use_data_reuploading: bool = False
+    ):
+        self.sim_method = sim_method
+        self.num_threads = num_threads
+        self.enable_logging = enable_logging
+        self.use_advanced_ansatz = use_advanced_ansatz
+        self.use_data_reuploading = use_data_reuploading
+        self.backend = self.initialize_simulator()
+
+    def initialize_simulator(self):
+        if self.sim_method == 'gpu':
+            backend = AerSimulator(method='statevector', device='GPU', max_parallel_threads=self.num_threads)
+            if self.enable_logging:
+                logging.info(f"{self.__class__.__name__}: Using GPU.")
+        elif self.sim_method == 'both':
+            backend = AerSimulator(method='statevector', device='GPU', max_parallel_threads=self.num_threads)
+            if self.enable_logging:
+                logging.info(f"{self.__class__.__name__}: Using Both CPU and GPU.")
+        elif self.sim_method == 'simulation':
+            backend = None
+            if self.enable_logging:
+                logging.info(f"{self.__class__.__name__}: Using pure simulation mode.")
+        else:
+            backend = AerSimulator(method='statevector', max_parallel_threads=self.num_threads)
+            if self.enable_logging:
+                logging.info(f"{self.__class__.__name__}: Using CPU.")
+        return backend
+
+    def build_circuit(self, input_vector: np.ndarray, param_store: QuantumParameterStore) -> QuantumCircuit:
+        if self.use_advanced_ansatz:
+            circuit = self.build_advanced_circuit(input_vector, param_store)
+        else:
+            circuit = self.build_simple_circuit(input_vector, param_store)
+        return circuit
+
+    def build_simple_circuit(self, input_vector: np.ndarray, param_store: QuantumParameterStore) -> QuantumCircuit:
+        qubits_needed = max(1, int(np.ceil(np.log2(len(input_vector)))))
+        circuit = QuantumCircuit(qubits_needed)
+        state_prep_vec = np.zeros(2**qubits_needed, dtype=complex)
+        state_prep_vec[:len(input_vector)] = input_vector.astype(complex)
+        state_prep_vec = normalize_vector(state_prep_vec)
+        circuit.initialize(state_prep_vec, qubits=range(qubits_needed))
+
+        num_layers = 2
+        for layer in range(num_layers):
+            for i in range(qubits_needed):
+                theta = param_store.values[layer * qubits_needed + i]
+                circuit.ry(theta, i)
+            for i in range(qubits_needed - 1):
+                circuit.cx(i, i + 1)
+        for i in range(qubits_needed):
+            theta = param_store.values[num_layers * qubits_needed + i]
+            circuit.ry(theta, i)
+        circuit.save_statevector()
+        return circuit
+
+    def build_advanced_circuit(self, input_vector: np.ndarray, param_store: QuantumParameterStore) -> QuantumCircuit:
+        qubits_needed = max(1, int(np.ceil(np.log2(len(input_vector)))))
+        circuit = QuantumCircuit(qubits_needed)
+        state_prep_vec = np.zeros(2**qubits_needed, dtype=complex)
+        state_prep_vec[:len(input_vector)] = input_vector.astype(complex)
+        state_prep_vec = normalize_vector(state_prep_vec)
+        circuit.initialize(state_prep_vec, qubits=range(qubits_needed))
+        layers = 2
+        offset = 0
+        for _ in range(layers):
+            for i in range(qubits_needed):
+                theta_ry = float(param_store.values[offset])
+                offset += 1
+                circuit.ry(theta_ry, i)
+
+                theta_rz = 0
+                if offset < param_store.size:
+                    theta_rz = float(param_store.values[offset])
+                    offset += 1
+                    circuit.rz(theta_rz, i)
+
+                if self.use_data_reuploading:
+                    scaled_angle = float(input_vector[i % len(input_vector)]) * 0.1
+                    circuit.rx(scaled_angle, i)
+            for i in range(qubits_needed):
+                next_qubit = (i + 1) % qubits_needed
+                circuit.cx(i, next_qubit)
+        circuit.save_statevector()
+        return circuit
+
+    def simulate(self, circuit: QuantumCircuit) -> np.ndarray:
+        if self.sim_method == 'simulation' or self.backend is None:
+            data = circuit.data
+            qubits_needed = circuit.num_qubits
+            if len(data) > 0 and data[0].operation.name == 'initialize':
+                init_vec = data[0].operation.params[0]
+                return init_vec
+            else:
+                return np.zeros(2**qubits_needed, dtype=complex)
+        else:
+            job = self.backend.run(circuit, shots=1)
+            result = job.result()
+            final_state = result.get_statevector(circuit)
+            return final_state.data
+
+
+class AdamOptimizer:
+    def __init__(self, parameters: np.ndarray, lr: float = 0.001, betas: Tuple[float, float] = (0.9, 0.999), eps: float = 1e-8):
+        self.parameters = parameters
+        self.lr = lr
+        self.betas = betas
+        self.eps = eps
+        self.m = np.zeros_like(self.parameters)
+        self.v = np.zeros_like(self.parameters)
+        self.t = 0
+
+    def step(self, gradients: np.ndarray):
+        self.t += 1
+        self.m = self.betas[0] * self.m + (1 - self.betas[0]) * gradients
+        self.v = self.betas[1] * self.v + (1 - self.betas[1]) * (gradients ** 2)
+        m_hat = self.m / (1 - self.betas[0] ** self.t)
+        v_hat = self.v / (1 - self.betas[1] ** self.t)
+        update = self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        self.parameters -= update
+        return self.parameters
+
+
+class AdvancedQuantumOptimizer:
+    def __init__(self, parameters: np.ndarray, lr: float = 0.001):
+        self.parameters = parameters
+        self.lr = lr
+
+    def step(self, gradients: np.ndarray):
+        self.parameters -= self.lr * gradients
+        return self.parameters
+
+
 def create_synthetic_dataset(vocab_size: int, num_samples: int = 500) -> Tuple[np.ndarray, np.ndarray]:
     X = np.random.randint(4, vocab_size, size=(num_samples,))
     Y = np.random.randint(4, vocab_size, size=(num_samples,))
@@ -820,11 +1402,13 @@ def create_synthetic_dataset(vocab_size: int, num_samples: int = 500) -> Tuple[n
 
 
 def load_real_dataset(file_path: str, vocab_size: int) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    import os
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"File {file_path} does not exist.")
     with open(file_path, 'r', encoding='utf-8') as f:
         text = f.read()
     tokens = word_tokenize(text.lower())
+    from collections import defaultdict
     freq = defaultdict(int)
     for token in tokens:
         freq[token] += 1
@@ -913,6 +1497,10 @@ def compute_gradient_for_parameter(args):
         knowledge_dim
     ) = args
     try:
+        manager = QuantumChannelManager()
+        required_channels = num_blocks * (num_heads + 2)
+        manager.create_channels(num_channels=required_channels)
+        decoder = SubBitDecoder(manager=manager)
         model = QuantumLanguageModel(
             vocab_size=vocab_size,
             embed_dim=embed_dim,
@@ -927,7 +1515,9 @@ def compute_gradient_for_parameter(args):
             use_context=use_context,
             use_positional_encoding=use_positional_encoding,
             use_knowledge_embedding=use_knowledge_embedding,
-            knowledge_dim=knowledge_dim
+            knowledge_dim=knowledge_dim,
+            manager=manager,
+            decoder=decoder
         )
         model.set_all_parameters(original_params)
         shift = np.pi / 2
@@ -937,12 +1527,10 @@ def compute_gradient_for_parameter(args):
             for x, y in zip(X, Y)
         ])
         model.unshift_parameter(i, shift)
-        model.shift_parameter(i, -shift)
         loss_minus = np.mean([
             cross_entropy_loss(model.forward([x], use_residual=True), y) 
             for x, y in zip(X, Y)
         ])
-        model.unshift_parameter(i, -shift)
         gradient = (loss_plus - loss_minus) / 2.0
         return i, gradient
     except Exception:
@@ -952,8 +1540,7 @@ def compute_gradient_for_parameter(args):
 
 def compute_gradients_parallel(
     model: QuantumLanguageModel,
-    X: np.ndarray,
-    Y: np.ndarray,
+    X, Y,
     num_processes: int = 1,
     progress_callback=None,
     batch_shifts: bool = False
@@ -962,8 +1549,6 @@ def compute_gradients_parallel(
     original_params = model.get_all_parameters().copy()
     total_params = len(original_params)
     block_size = 100
-    if batch_shifts:
-        pass
     args_list = []
     sim_method_used = model.blocks[0].attn.sim_method if model.blocks else model.attn.sim_method
     num_threads_used = model.blocks[0].attn.num_threads if model.blocks else model.attn.num_threads
@@ -1003,8 +1588,7 @@ def compute_gradients_parallel(
 
 def train_model(
     model: QuantumLanguageModel,
-    X: np.ndarray,
-    Y: np.ndarray,
+    X, Y,
     epochs: int = 10,
     lr: float = 0.001,
     num_threads: int = 1,
@@ -1040,8 +1624,7 @@ def train_model(
                 embedded_x = model.embeddings[x_val]
                 new_x = quantum_data_augmentation(embedded_x)
                 augmented_X.append(new_x)
-            # Not a strict ID-based approach, just a demonstration that we apply augmentation to the embedding
-            pass
+            # demonstration only
         gradients = compute_gradients_parallel(
             model,
             X,
@@ -1133,11 +1716,14 @@ def get_gpu_usage() -> Optional[str]:
         return "N/A"
 
 
+# --------------------------------------------------------------------
+# GUI (QELM)
+# --------------------------------------------------------------------
 class QELM_GUI:
     def __init__(self, master):
         try:
             self.master = master
-            master.title("QELM Trainer - Enhanced V3")
+            master.title("QELM Trainer - V-Q")
             master.geometry("1440x900")
             master.resizable(False, False)
             self.vocab_size = 100
@@ -1149,6 +1735,9 @@ class QELM_GUI:
             self.use_advanced_ansatz = False
             self.use_data_reuploading = False
             self.num_blocks = 1
+            # decimal_precision is used for channel encoding
+            self.decimal_precision = 4
+
             self.model = QuantumLanguageModel(
                 self.vocab_size,
                 self.embed_dim,
@@ -1220,54 +1809,68 @@ class QELM_GUI:
     def create_widgets(self):
         container = ttk.Frame(self.master)
         container.pack(fill='both', expand=True)
+
         left_frame = ttk.Frame(container)
         left_frame.pack(side='left', fill='both', expand=True, padx=10, pady=10)
         right_frame = ttk.Frame(container)
         right_frame.pack(side='right', fill='y', padx=10, pady=10)
+
         self.notebook = ttk.Notebook(left_frame)
         self.tab_train = ttk.Frame(self.notebook)
         self.tab_infer = ttk.Frame(self.notebook)
         self.tab_manage = ttk.Frame(self.notebook)
+
         self.notebook.add(self.tab_train, text='Train Model')
         self.notebook.add(self.tab_infer, text='Run Inference')
         self.notebook.add(self.tab_manage, text='Manage Token Mappings')
         self.notebook.pack(fill='both', expand=True)
+
+        # Train Model Tab
         dataset_frame = ttk.LabelFrame(self.tab_train, text="Dataset Selection")
         dataset_frame.pack(fill='x', padx=10, pady=10)
         self.dataset_path_var = tk.StringVar(value="No dataset selected.")
         ttk.Label(dataset_frame, textvariable=self.dataset_path_var).pack(side='left', padx=10, pady=10)
         select_dataset_btn = ttk.Button(dataset_frame, text="Select Dataset", command=self.select_dataset)
         select_dataset_btn.pack(side='right', padx=10, pady=10)
+
         hyperparams_frame = ttk.LabelFrame(self.tab_train, text="Model Parameters")
         hyperparams_frame.pack(fill='x', padx=10, pady=10)
         hyperparams_left = ttk.Frame(hyperparams_frame)
         hyperparams_left.pack(side='left', fill='both', expand=True, padx=10, pady=10)
+
         ttk.Label(hyperparams_left, text="Vocabulary Size:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
         self.vocab_size_entry = ttk.Entry(hyperparams_left, width=15, style="Custom.TEntry")
         self.vocab_size_entry.insert(0, str(self.vocab_size))
         self.vocab_size_entry.grid(row=0, column=1, padx=10, pady=10, sticky='w')
+
         ttk.Label(hyperparams_left, text="Embedding Dimension:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
         self.embed_dim_entry = ttk.Entry(hyperparams_left, width=15, style="Custom.TEntry")
         self.embed_dim_entry.insert(0, str(self.embed_dim))
         self.embed_dim_entry.grid(row=1, column=1, padx=10, pady=10, sticky='w')
+
         ttk.Label(hyperparams_left, text="Number of Attention Heads:").grid(row=2, column=0, padx=10, pady=10, sticky='e')
         self.num_heads_entry = ttk.Entry(hyperparams_left, width=15, style="Custom.TEntry")
         self.num_heads_entry.insert(0, str(self.num_heads))
         self.num_heads_entry.grid(row=2, column=1, padx=10, pady=10, sticky='w')
+
         hyperparams_right = ttk.Frame(hyperparams_frame)
         hyperparams_right.pack(side='right', fill='both', expand=True, padx=10, pady=10)
+
         ttk.Label(hyperparams_right, text="Hidden Dimension:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
         self.hidden_dim_entry = ttk.Entry(hyperparams_right, width=15, style="Custom.TEntry")
         self.hidden_dim_entry.insert(0, str(self.hidden_dim))
         self.hidden_dim_entry.grid(row=0, column=1, padx=10, pady=10, sticky='w')
+
         ttk.Label(hyperparams_right, text="Learning Rate:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
         self.lr_entry = ttk.Entry(hyperparams_right, width=15, style="Custom.TEntry")
         self.lr_entry.insert(0, "0.001")
         self.lr_entry.grid(row=1, column=1, padx=10, pady=10, sticky='w')
+
         ttk.Label(hyperparams_right, text="Epochs:").grid(row=2, column=0, padx=10, pady=10, sticky='e')
         self.epochs_entry = ttk.Entry(hyperparams_right, width=15, style="Custom.TEntry")
         self.epochs_entry.insert(0, "2")
         self.epochs_entry.grid(row=2, column=1, padx=10, pady=10, sticky='w')
+
         sim_settings_frame = ttk.LabelFrame(self.tab_train, text="Simulation Settings")
         sim_settings_frame.pack(fill='x', padx=10, pady=10)
         ttk.Label(sim_settings_frame, text="Simulation Method:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
@@ -1280,23 +1883,34 @@ class QELM_GUI:
         gpu_radio.grid(row=0, column=2, padx=10, pady=10, sticky='w')
         both_radio.grid(row=0, column=3, padx=10, pady=10, sticky='w')
         simulation_radio.grid(row=0, column=4, padx=10, pady=10, sticky='w')
+
         ttk.Label(sim_settings_frame, text="Number of Threads:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
         self.num_threads_var = tk.IntVar(value=self.num_threads)
         self.num_threads_spinbox = ttk.Spinbox(sim_settings_frame, from_=1, to=multiprocessing.cpu_count(), textvariable=self.num_threads_var, width=5)
         self.num_threads_spinbox.grid(row=1, column=1, padx=10, pady=10, sticky='w')
         ttk.Label(sim_settings_frame, text=f"(Max: {multiprocessing.cpu_count()})").grid(row=1, column=2, padx=10, pady=10, sticky='w')
+
         adv_settings_frame = ttk.LabelFrame(self.tab_train, text="Advanced Quantum Settings")
         adv_settings_frame.pack(fill='x', padx=10, pady=10)
         self.use_advanced_ansatz_var = tk.BooleanVar(value=False)
         self.use_data_reuploading_var = tk.BooleanVar(value=False)
         self.num_blocks_var = tk.IntVar(value=1)
+
         ttk.Checkbutton(adv_settings_frame, text='Use Advanced Ansatz', variable=self.use_advanced_ansatz_var).grid(row=0, column=0, padx=10, pady=10, sticky='w')
         ttk.Checkbutton(adv_settings_frame, text='Use Data Reuploading', variable=self.use_data_reuploading_var).grid(row=0, column=1, padx=10, pady=10, sticky='w')
         ttk.Label(adv_settings_frame, text="Number of Blocks:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
         self.blocks_spinbox = ttk.Spinbox(adv_settings_frame, from_=1, to=10, textvariable=self.num_blocks_var, width=5)
         self.blocks_spinbox.grid(row=1, column=1, padx=10, pady=10, sticky='w')
+
+        # decimal precision spinbox
+        ttk.Label(adv_settings_frame, text="Decimal Precision:").grid(row=1, column=2, padx=10, pady=10, sticky='e')
+        self.decimal_precision_var = tk.IntVar(value=self.decimal_precision)
+        self.decimal_precision_spinbox = ttk.Spinbox(adv_settings_frame, from_=0, to=10, textvariable=self.decimal_precision_var, width=5)
+        self.decimal_precision_spinbox.grid(row=1, column=3, padx=10, pady=10, sticky='w')
+
         train_controls_frame = ttk.Frame(self.tab_train)
         train_controls_frame.pack(fill='x', padx=10, pady=10)
+
         self.train_button = ttk.Button(train_controls_frame, text="Start Training", command=self.train_model)
         self.train_button.pack(side='left', padx=10, pady=10)
         stop_button = ttk.Button(train_controls_frame, text="Stop (Graceful)", command=self.stop_training)
@@ -1307,51 +1921,65 @@ class QELM_GUI:
         self.save_button.pack(side='left', padx=10, pady=10)
         self.load_button = ttk.Button(train_controls_frame, text="Load Model", command=self.load_model)
         self.load_button.pack(side='left', padx=10, pady=10)
+
         progress_bars_frame = ttk.Frame(self.tab_train)
         progress_bars_frame.pack(fill='x', padx=10, pady=10)
+
         ttk.Label(progress_bars_frame, text="Training Progress:").pack(anchor='w', padx=10, pady=5)
         self.epoch_progress = ttk.Progressbar(progress_bars_frame, orient='horizontal', length=600, mode='determinate')
         self.epoch_progress.pack(fill='x', padx=10, pady=5)
+
         ttk.Label(progress_bars_frame, text="Gradient Computation Progress:").pack(anchor='w', padx=10, pady=5)
         self.gradient_progress = ttk.Progressbar(progress_bars_frame, orient='horizontal', length=600, mode='determinate')
         self.gradient_progress.pack(fill='x', padx=10, pady=5)
+
         log_frame = ttk.LabelFrame(self.tab_train, text="Training Log")
         log_frame.pack(fill='both', expand=True, padx=10, pady=10)
         self.train_log = scrolledtext.ScrolledText(log_frame, state='disabled', wrap='word', font=("Courier", 10), bg="#2C3E50", fg="white", insertbackground="white")
         self.train_log.pack(fill='both', expand=True, padx=5, pady=5)
+
         eval_metrics_frame = ttk.LabelFrame(self.tab_train, text="Evaluation Metrics")
         eval_metrics_frame.pack(fill='x', padx=10, pady=10)
         self.perplexity_label = ttk.Label(eval_metrics_frame, text="Perplexity: N/A")
         self.perplexity_label.pack(anchor='w', padx=10, pady=5)
         self.bleu_label = ttk.Label(eval_metrics_frame, text="BLEU Score: N/A")
         self.bleu_label.pack(anchor='w', padx=10, pady=5)
+
+        # Inference Tab
         inference_frame = ttk.LabelFrame(self.tab_infer, text="Inference")
         inference_frame.pack(fill='x', padx=10, pady=10)
         ttk.Label(inference_frame, text="Input Token:").grid(row=0, column=0, padx=10, pady=10, sticky='e')
         self.input_token_entry = ttk.Entry(inference_frame, width=30, style="Custom.TEntry")
         self.input_token_entry.grid(row=0, column=1, padx=10, pady=10, sticky='w')
+
         ttk.Label(inference_frame, text="Max Length:").grid(row=1, column=0, padx=10, pady=10, sticky='e')
         self.max_length_entry = ttk.Entry(inference_frame, width=15, style="Custom.TEntry")
         self.max_length_entry.insert(0, "50")
         self.max_length_entry.grid(row=1, column=1, padx=10, pady=10, sticky='w')
+
         ttk.Label(inference_frame, text="Temperature:").grid(row=2, column=0, padx=10, pady=10, sticky='e')
         self.temperature_entry = ttk.Entry(inference_frame, width=15, style="Custom.TEntry")
         self.temperature_entry.insert(0, "1.0")
         self.temperature_entry.grid(row=2, column=1, padx=10, pady=10, sticky='w')
+
         inference_controls_frame = ttk.Frame(self.tab_infer)
         inference_controls_frame.pack(fill='x', padx=10, pady=10)
         self.infer_button = ttk.Button(inference_controls_frame, text="Run Inference", command=self.run_inference)
         self.infer_button.pack(side='left', padx=10, pady=10)
+
         infer_log_frame = ttk.LabelFrame(self.tab_infer, text="Inference Output")
         infer_log_frame.pack(fill='both', expand=True, padx=10, pady=10)
         self.infer_log = scrolledtext.ScrolledText(infer_log_frame, state='disabled', wrap='word', font=("Courier", 10), bg="#2C3E50", fg="white", insertbackground="white")
         self.infer_log.pack(fill='both', expand=True, padx=5, pady=5)
+
+        # Manage Token Mappings Tab
         token_map_frame = ttk.LabelFrame(self.tab_manage, text="Token Mappings")
         token_map_frame.pack(fill='both', expand=True, padx=10, pady=10)
         load_token_map_button = ttk.Button(token_map_frame, text="Load Token Map", command=self.load_token_map)
         load_token_map_button.pack(side='top', padx=10, pady=10)
         self.token_map_display = scrolledtext.ScrolledText(token_map_frame, state='disabled', wrap='word', font=("Courier", 10), bg="#2C3E50", fg="white", insertbackground="white")
         self.token_map_display.pack(fill='both', expand=True, padx=5, pady=5)
+
         usage_frame = ttk.LabelFrame(right_frame, text="System Resources & Time")
         usage_frame.pack(fill='y', padx=5, pady=5)
         self.cpu_label = ttk.Label(usage_frame, text="CPU: N/A")
@@ -1360,6 +1988,7 @@ class QELM_GUI:
         self.gpu_label.pack(anchor='w', padx=10, pady=5)
         self.time_label = ttk.Label(usage_frame, text="Elapsed: 0s | Remaining: Estimating...")
         self.time_label.pack(anchor='w', padx=10, pady=5)
+
         error_log_frame = ttk.LabelFrame(right_frame, text="Error Log Configuration")
         error_log_frame.pack(fill='x', padx=5, pady=20, side='bottom')
         select_error_log_btn = ttk.Button(error_log_frame, text="Select Error Log Save Location", command=self.select_error_log)
@@ -1465,9 +2094,9 @@ class QELM_GUI:
             if file_path:
                 self.dataset_path = file_path
                 self.dataset_path_var.set(file_path)
-                self.log_train(f"Selected Dataset: {file_path}\n")
                 self.token_to_id = {}
                 self.id_to_token = {}
+                self.log_train(f"Selected Dataset: {file_path}\n")
         except Exception as e:
             err_msg = f"Error selecting dataset:\n{traceback.format_exc()}"
             self.log_train(err_msg + "\n")
@@ -1481,7 +2110,8 @@ class QELM_GUI:
             hidden_dim = int(self.hidden_dim_entry.get())
             lr = float(self.lr_entry.get())
             epochs = int(self.epochs_entry.get())
-            if vocab_size <= 0 or embed_dim <= 0 or num_heads <= 0 or hidden_dim <= 0 or lr <= 0 or epochs <= 0:
+            num_blocks = int(self.num_blocks_var.get())
+            if vocab_size <= 0 or embed_dim <= 0 or num_heads <= 0 or hidden_dim <= 0 or lr <= 0 or epochs <= 0 or num_blocks <= 0:
                 raise ValueError
             if embed_dim % num_heads != 0:
                 messagebox.showerror("Invalid Input", "Embedding Dimension must be divisible by Number of Attention Heads.")
@@ -1489,6 +2119,7 @@ class QELM_GUI:
         except ValueError:
             messagebox.showerror("Invalid Input", "Please enter valid positive integers for model parameters and epochs, and a positive float for learning rate.")
             return
+
         sim_method = self.sim_method_var.get()
         num_threads = self.num_threads_var.get()
         max_threads = multiprocessing.cpu_count()
@@ -1498,16 +2129,28 @@ class QELM_GUI:
             self.num_threads_var.set(num_threads)
         self.use_advanced_ansatz = self.use_advanced_ansatz_var.get()
         self.use_data_reuploading = self.use_data_reuploading_var.get()
-        self.num_blocks = self.num_blocks_var.get()
+        self.num_blocks = num_blocks
+        self.decimal_precision = self.decimal_precision_var.get()
+
+        use_exponential_tokenizer = False
+
         if hasattr(self, 'dataset_path') and self.dataset_path:
             dataset_path = self.dataset_path
             try:
-                X, Y, token_to_id = load_real_dataset(dataset_path, vocab_size)
-                self.X = X
-                self.Y = Y
-                self.token_to_id = token_to_id
-                self.id_to_token = {idx: token for token, idx in token_to_id.items()}
-                self.log_train(f"Loaded real dataset from {dataset_path}\n")
+                if use_exponential_tokenizer:
+                    X, Y, token_map, id_map = load_dataset_with_exponential_tokenizer(dataset_path, vocab_size)
+                    self.X = X
+                    self.Y = Y
+                    self.token_to_id = token_map
+                    self.id_to_token = id_map
+                    self.log_train(f"Loaded dataset with exponential subword tokenizer from {dataset_path}\n")
+                else:
+                    X, Y, token_to_id = load_real_dataset(dataset_path, vocab_size)
+                    self.X = X
+                    self.Y = Y
+                    self.token_to_id = token_to_id
+                    self.id_to_token = {idx: token for token, idx in token_to_id.items()}
+                    self.log_train(f"Loaded real dataset from {dataset_path}\n")
             except Exception as e:
                 err_msg = f"Failed to load dataset:\n{traceback.format_exc()}"
                 self.log_train(err_msg + "\n")
@@ -1520,18 +2163,33 @@ class QELM_GUI:
             self.log_train("Using synthetic dataset for training.\n")
             self.token_to_id = {f"<TOKEN_{i}>": i for i in range(vocab_size)}
             self.id_to_token = {i: f"<TOKEN_{i}>" for i in range(vocab_size)}
+
         try:
+            manager = self.model.qc_manager
+            decoder = self.model.decoder
+            required_channels = self.num_blocks * (self.num_heads + 2)
+            current_channels = len(manager.channels)
+            if current_channels < required_channels:
+                additional_channels = required_channels - current_channels
+                manager.create_channels(num_channels=additional_channels, decimal_precision=self.decimal_precision)
+                self.log_train(f"Created additional {additional_channels} Quantum Channels to meet the requirement.\n")
             self.model = QuantumLanguageModel(
-                vocab_size, 
-                embed_dim, 
-                num_heads, 
+                vocab_size,
+                embed_dim,
+                num_heads,
                 hidden_dim,
-                sim_method=sim_method, 
-                num_threads=num_threads, 
+                sim_method=sim_method,
+                num_threads=num_threads,
                 enable_logging=True,
                 use_advanced_ansatz=self.use_advanced_ansatz,
                 use_data_reuploading=self.use_data_reuploading,
-                num_blocks=self.num_blocks
+                num_blocks=self.num_blocks,
+                use_context=self.model.use_context,
+                use_positional_encoding=self.model.use_positional_encoding,
+                use_knowledge_embedding=self.model.use_knowledge_embedding,
+                knowledge_dim=self.model.knowledge_dim,
+                manager=manager,
+                decoder=decoder
             )
             self.optimizer = AdamOptimizer(self.model.get_all_parameters(), lr=lr)
             self.log_train("Model re-initialized with new parameters.\n")
@@ -1540,6 +2198,7 @@ class QELM_GUI:
             self.log_train(err_msg + "\n")
             messagebox.showerror("Model Initialization Error", err_msg)
             return
+
         if sim_method == 'both':
             try:
                 if not self.model.blocks:
@@ -1573,6 +2232,7 @@ class QELM_GUI:
                     block.ffn.sim_method = sim_method
                     block.attn.backend = block.attn.initialize_simulator()
                     block.ffn.backend = block.ffn.initialize_simulator()
+
         self.train_button.config(state='disabled')
         self.save_button.config(state='disabled')
         self.load_button.config(state='disabled')
@@ -1668,7 +2328,7 @@ class QELM_GUI:
                         self.token_to_id = json.load(f)
                     self.id_to_token = {int(idx): token for token, idx in self.token_to_id.items()}
                     if len(self.token_to_id) != self.model.vocab_size:
-                        raise ValueError(f"Loaded token mapping size {len(self.token_to_id)} does not match model's vocab_size {self.model.vocab_size}.")
+                        raise ValueError(f"Token mapping size {len(self.token_to_id)} does not match model's vocab_size {self.model.vocab_size}.")
                     self.log_train(f"Loaded token mappings from {token_map_path}\n")
                     self.display_token_map()
                 except FileNotFoundError:
@@ -1803,6 +2463,7 @@ class QELM_GUI:
             perp = perplexity(logits, y)
             perplexities.append(perp)
         avg_perplexity = np.mean(perplexities)
+
         hypotheses = []
         references = []
         for x, y in zip(self.X, self.Y):
@@ -1810,11 +2471,13 @@ class QELM_GUI:
             predicted = np.argmax(logits)
             hypotheses.append([self.id_to_token.get(predicted, "<UNK>")])
             references.append([self.id_to_token.get(y, "<UNK>")])
+
         bleu_scores_list = []
         for ref, hyp in zip(references, hypotheses):
             bleu_val = bleu_score(ref, hyp)
             bleu_scores_list.append(bleu_val)
         avg_bleu = np.mean(bleu_scores_list)
+
         self.perplexity_label.config(text=f"Perplexity: {avg_perplexity:.4f}")
         self.bleu_label.config(text=f"BLEU Score: {avg_bleu:.4f}")
 
@@ -1822,6 +2485,11 @@ class QELM_GUI:
 def main():
     try:
         root = tk.Tk()
+        manager = QuantumChannelManager()
+        manager.create_channels(num_channels=100)
+        decoder = SubBitDecoder(manager=manager)
+        root.qc_manager = manager
+        root.decoder = decoder
         gui = QELM_GUI(root)
         multiprocessing.freeze_support()
         root.mainloop()
@@ -1832,6 +2500,135 @@ def main():
         hidden_root.withdraw()
         messagebox.showerror("Unexpected Error", f"An unexpected error occurred:\n{e}\n\nCheck the log file for more details.")
         sys.exit(1)
+
+
+# --------------------------------------------------------------------
+# QuantumAttentionLayer and QuantumFeedForwardLayer remain the same
+# --------------------------------------------------------------------
+class QuantumAttentionLayer(QuantumLayerBase):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        sim_method: str = 'cpu',
+        num_threads: int = 1,
+        prefix: str = "attn",
+        enable_logging: bool = True,
+        use_advanced_ansatz: bool = False,
+        use_data_reuploading: bool = False
+    ):
+        super().__init__(sim_method=sim_method, num_threads=num_threads, enable_logging=enable_logging,
+                         use_advanced_ansatz=use_advanced_ansatz, use_data_reuploading=use_data_reuploading)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.prefix = prefix
+        self.query_params = QuantumParameterStore(size=embed_dim, prefix=f"{self.prefix}_query")
+        self.key_params = QuantumParameterStore(size=embed_dim, prefix=f"{self.prefix}_key")
+        self.value_params = QuantumParameterStore(size=embed_dim, prefix=f"{self.prefix}_value")
+        self.out_params = QuantumParameterStore(size=embed_dim, prefix=f"{self.prefix}_out")
+
+    def forward(self, x: np.ndarray, mode: str = 'query') -> float:
+        if mode == 'query':
+            param_store = self.query_params
+        elif mode == 'key':
+            param_store = self.key_params
+        elif mode == 'value':
+            param_store = self.value_params
+        else:
+            param_store = self.out_params
+        circuit = self.build_circuit(x, param_store)
+        final_state = self.simulate(circuit)
+        output = np.abs(final_state[0])**2
+        return float(output)
+
+    def get_all_parameters(self) -> np.ndarray:
+        return np.concatenate([
+            self.query_params.get_values(),
+            self.key_params.get_values(),
+            self.value_params.get_values(),
+            self.out_params.get_values()
+        ])
+
+    def set_all_parameters(self, params: np.ndarray):
+        total_size = self.query_params.size + self.key_params.size + self.value_params.size + self.out_params.size
+        if len(params) != total_size:
+            raise ValueError(f"Parameter size mismatch in {self.prefix}. Expected {total_size}, got {len(params)}.")
+        offset = 0
+        self.query_params.set_values(params[offset:offset + self.query_params.size])
+        offset += self.query_params.size
+        self.key_params.set_values(params[offset:offset + self.key_params.size])
+        offset += self.key_params.size
+        self.value_params.set_values(params[offset:offset + self.value_params.size])
+        offset += self.value_params.size
+        self.out_params.set_values(params[offset:offset + self.out_params.size])
+
+    def to_dict(self) -> dict:
+        return {
+            "query_params": self.query_params.to_dict(),
+            "key_params": self.key_params.to_dict(),
+            "value_params": self.value_params.to_dict(),
+            "out_params": self.out_params.to_dict()
+        }
+
+    def from_dict(self, d: dict):
+        self.query_params.from_dict(d["query_params"])
+        self.key_params.from_dict(d["key_params"])
+        self.value_params.from_dict(d["value_params"])
+        self.out_params.from_dict(d["out_params"])
+
+
+class QuantumFeedForwardLayer(QuantumLayerBase):
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        sim_method: str = 'cpu',
+        num_threads: int = 1,
+        prefix: str = "ffn",
+        enable_logging: bool = True,
+        use_advanced_ansatz: bool = False,
+        use_data_reuploading: bool = False
+    ):
+        super().__init__(sim_method=sim_method, num_threads=num_threads, enable_logging=enable_logging,
+                         use_advanced_ansatz=use_advanced_ansatz, use_data_reuploading=use_data_reuploading)
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.prefix = prefix
+        self.w1_params = QuantumParameterStore(size=embed_dim, prefix=f"{self.prefix}_w1")
+        self.w2_params = QuantumParameterStore(size=embed_dim, prefix=f"{self.prefix}_w2")
+
+    def forward(self, x: np.ndarray, layer: str = 'w1') -> float:
+        if layer == 'w1':
+            param_store = self.w1_params
+        else:
+            param_store = self.w2_params
+        circuit = self.build_circuit(x, param_store)
+        final_state = self.simulate(circuit)
+        output = np.abs(final_state[0])**2
+        return float(output)
+
+    def get_all_parameters(self) -> np.ndarray:
+        return np.concatenate([
+            self.w1_params.get_values(),
+            self.w2_params.get_values()
+        ])
+
+    def set_all_parameters(self, params: np.ndarray):
+        total_size = self.w1_params.size + self.w2_params.size
+        if len(params) != total_size:
+            raise ValueError(f"Parameter size mismatch in {self.prefix}. Expected {total_size}, got {len(params)}.")
+        self.w1_params.set_values(params[:self.w1_params.size])
+        self.w2_params.set_values(params[self.w1_params.size:])
+
+    def to_dict(self) -> dict:
+        return {
+            "w1_params": self.w1_params.to_dict(),
+            "w2_params": self.w2_params.to_dict()
+        }
+
+    def from_dict(self, d: dict):
+        self.w1_params.from_dict(d["w1_params"])
+        self.w2_params.from_dict(d["w2_params"])
 
 
 if __name__ == "__main__":
